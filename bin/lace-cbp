@@ -1,0 +1,156 @@
+#!/usr/bin/env ruby
+
+$: << File.dirname(__FILE__)
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+
+module Lace
+	class CBProjectFileWriter < ProjectFileWriterBase
+		def make_local(path)
+			Helpers.make_relative(path).gsub(/\//, '\\')
+		end
+		
+		def write(filename)
+			defbuild = to_path(__FILE__).dirname + 'defbuild.rb'
+			open_file(filename) do |file|
+				project_name = @project.name
+ 
+				file.puts "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>\n<CodeBlocks_project_file>\n"
+				file.puts "\t<FileVersion major=\"1\" minor=\"6\" />\n"
+				file.puts "\t<Project>\n"
+				file.puts "\t\t<Option title=\"#{project_name}\" />\n"
+				file.puts "\t\t<Option makefile_is_custom=\"1\" />\n"
+				file.puts "\t\t<Option compiler=\"gcc\" />\n"
+				file.puts "\t\t<Build>\n"
+				@builds.each do |build|
+					target_dir = make_local(@project.path + 'build' + build)
+					build_cmd = build_command(build)
+					file.puts "\t\t\t<Target title=\"#{build.gsub(/\//, '_')}\">\n"
+					file.puts "\t\t\t\t<Option output=\"#{target_dir + 'unnamed.exe'}\" prefix_auto=\"0\" extension_auto=\"0\" />\n"
+					file.puts "\t\t\t\t<Option type=\"0\" />\n"
+					file.puts "\t\t\t\t<Option compiler=\"gcc\" />\n"
+
+#					OutputDirectory=\"#{target_dir}\" IntermediateDirectory=\"#{target_dir}\" ConfigurationType=\"0\">"
+					file.puts  "\t\t\t\t<MakeCommands>\n"
+					file.puts "\t\t\t\t\t<Build command=\"#{build_cmd} build\" />\n"
+					file.puts "\t\t\t\t\t<Clean command=\"#{build_cmd} -c\" />\n"
+					file.puts  "\t\t\t\t</MakeCommands>\n"
+#					Output=\"#{target_dir}\\#{executable_file_name}\""
+					
+					#~ include_dirs = get_attribute(:cpp_include_dir, build)
+					#~ unless include_dirs.empty?
+						#~ file.write include_key_word
+						#~ file.write include_dirs.map {|einc| make_local(einc)}.join(';')
+						#~ file.write "\""
+					#~ end
+					#~ file.puts "/>"
+
+					file.puts "\t\t\t</Target>\n"
+				end
+				
+				file.puts "\t\t</Build>\n"
+				
+				filenames = get_files
+
+				# now put all the files...
+
+				# first, recreate the folder structure of the files. We do it the following way : we split a folder from the beginning of the pathname. We check a hash for the given folder.
+				# if its not there, we put it there, we put another hash in the hash for the folders in there.
+				# if we, however, find a filename, we put it into an array that is in the hash under the name of '.'
+				# after that, we get the keys of the hash, sort the list of keys and output the data recursiveley.
+
+				folders = {}
+				folders["."] = []	# the files here
+
+				# now make relativ paths from the filenames
+				filenames = filenames.map {|filename| make_local(filename) }
+
+				# create a hash holding an array for all files in that folder and another hash for each directory.
+				filenames.each do |filename|
+					namefolders = filename.split(/\/|\\/)
+					basename = namefolders.pop
+					while namefolders.at(0) == ".."
+						namefolders.shift
+					end
+					currenthash = folders
+					namefolders.each do |f|
+						if (not currenthash[f])
+							currenthash[f] = {}
+						end
+						currenthash = currenthash[f]
+					end
+					
+					if (not currenthash["."])
+						currenthash["."] = []
+					end
+					currenthash["."] << filename
+				end
+
+				# now recurse through the hashes that each represent a folder
+				#write_folders(file, folders, 2)
+
+				filenames.each do |f|
+					file << "\t\t<Unit filename=\"#{f}\"/>\n"
+				end
+				file.puts "\t</Project>\n"
+
+				file.puts "</CodeBlocks_project_file>\n"
+			end
+		end
+		
+		def write_folders(output, folderhash, indent)
+			
+			folders = folderhash.keys.sort
+			# make sure the folders appear in front of the files.
+			top = folders.at(0)
+			if (top and top == ".")
+				folders.push(folders.shift)
+			end
+
+			folders.each do |folder|
+				if (folder == ".")
+					filenames = folderhash[folder].sort
+					filenames.each do |filename|
+						output << ?\t.chr * (indent+1)
+						output << "<File RelativePath=\"" + filename.gsub(/\//, '\\') + "\"/>\n"
+					end
+				else
+					output << ?\t.chr * (indent+1)
+					output << "<Filter Name=\"#{folder}\" Filter=\"\">\n"
+					write_folders(output, folderhash[folder], indent+1)
+					output << ?\t.chr * (indent+1)
+					output << "</Filter>\n"
+				end
+			end
+		end
+	end
+end
+
+project_file = 'project.lace'
+cbproj_file = nil
+cbproj_jobs = ENV['NUMBER_OF_PROCESSORS'] || '1'
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: lace-cbp.rb [OPTIONS] [BUILDS]"
+	opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+		project_file = fname
+	end
+	opts.on("-o", "--output CBPROJ_FILENAME", "The filename of the resulting .cbp file (default: build/<project_name>.cbp)") do |fname|
+		cbproj_file = fname
+	end
+	opts.on("-j", "--jobs NUM_JOBS", Integer, "Number of compile jobs to execute in parallel") do |jobs|
+		cbproj_jobs = jobs
+	end
+end.parse!
+
+if ARGV.empty?
+	puts 'Error: no build targets given.'
+	exit 1
+end
+
+writer = Lace::CBProjectFileWriter.new(project_file, ARGV)
+writer.write(cbproj_file ? cbproj_file : writer.project.path + "build/#{writer.project.name}.cbp")

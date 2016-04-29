@@ -1,0 +1,149 @@
+#!/usr/bin/env ruby
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+require 'json'
+
+module Lace
+	class SublProjectFileWriter < ProjectFileWriterBase
+        attr_reader :gdb_params
+        attr_writer :gdb_params
+
+        def create_cmd( cmd )
+            if get_host_platform == :win32
+                return cmd
+            else
+                return cmd.join( ' ' )
+            end
+        end
+
+		def write(filename,jobs)
+			open_file(filename) do |file|
+				project_name = @project.name
+
+                host_platform = get_host_platform().to_s
+
+                import_paths = @project.import_paths.map { |ip| ip = ip.expand_path.to_s }.sort_by { |x| x.length }
+                module_paths = []
+                import_paths.each { |ip|
+                    if module_paths.find{ |p| ip.index( p ) } == nil
+                        module_paths << ip
+                    end
+                }
+
+                # filter out all third party folders for now:
+                folders = module_paths.select { |p| p.index( "third_party" ) == nil }
+
+                lace_cmd = get_lace_bin().expand_path.to_s
+
+                build_systems = []
+                subpp_build_tags = {}
+
+                debug_exe_path = nil
+                test_exe_path = nil
+
+                @builds.each { |build|
+
+                    variants = []
+                    variants << {"name" => "Rebuild","cmd" => create_cmd( [ "ruby", "#{lace_cmd}", "-r", "-b", "#{build}", "#{@project.path}/project.lace" ] ) }
+
+                    if build.include? host_platform
+                        exe_path = get_build_executable_path( build )
+                        variants << {"name" => "Run","cmd" => [ "#{exe_path}" ] }
+
+                        if build.include? 'debug'
+                            debug_exe_path = exe_path
+                        end
+                        if build.include? 'test'
+                            test_exe_path = exe_path
+                        end
+                    end
+
+                    underscore = build.index("_")
+                    postfix = if underscore then build[0, underscore] else build end
+                    build_tag = build.gsub(/\//, '|')
+
+                    build_systems <<
+                    {
+                        "name" => build_tag,
+                        "cmd" => create_cmd( [ "ruby", "#{lace_cmd}", "-b", "#{build}", "#{@project.path}/project.lace" ] ),
+                        "file_regex" => "^\\s*([^(\n\\s]*)\\s*\\(([0-9]*)(,\\s*[0-9]*)?\\)\s*: (.*)$",
+
+                        "working_dir" => "#{@project.path}/build",
+                        "shell" => true,
+
+                        "variants" => variants
+                    }
+
+                    subpp_build_tags[build_tag] =
+                    {
+                        "code_postfix" => postfix,
+                        "module_map_path" => "#{@project.path}/build/#{build}/misc/unity_map.json",
+                        "command_line_map_path" => "#{@project.path}/build/#{build}/misc/command_lines.json"
+                    }
+                }
+
+                debug_exe_path = debug_exe_path || test_exe_path
+
+                settings = {}
+
+                if debug_exe_path
+                    head, sep, tail = debug_exe_path.to_s.partition('build')
+                    if !tail.empty?
+                        settings[ "sublimegdb_workingdir" ] = "${folder:${project_path:#{sep + tail}}}"
+                        settings[ "sublimegdb_commandline" ] = "gdb --interpreter=mi --args ./#{debug_exe_path.basename} #{self.gdb_params}"
+                    end
+                end
+
+                settings["sub++_enable"] = true
+                settings["sub++_project_root_path"] = ".."
+                settings["sub++_build_tags"] = subpp_build_tags
+
+                #include_patterns = ["*.cpp", "*.hpp", "*.inl", "*.c", "*.h", "*.bdef", "*.ds", "*.lace", "*.crc", "*.mm", "*.java"]
+                exclude_patterns = ["*.exe", "*.dll", "*.obj", "*.o", "*.a", "*.lib", "*.jar", "*.zip" ]
+
+				subl_project = {
+					"folders" => folders.map { |f| { "follow_symlinks" => true, "path" => f, "file_exclude_patterns" => exclude_patterns, "folder_exclude_patterns" => [  ] } },
+					"settings" => settings,
+					"build_systems" => build_systems
+				}
+				file.write( JSON.pretty_generate( subl_project ) )
+            end
+        end
+	end
+end
+
+project_file = 'project.lace'
+subproj_file = nil
+jobs = ENV['NUMBER_OF_PROCESSORS'] || '1'
+build_path = nil
+gdb_params = nil
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: lace-sublime.rb [OPTIONS] [BUILDS]"
+	opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+		project_file = fname
+	end
+	opts.on("-o", "--output subproj_filename", "The filename of the resulting .sublime-project file (default: build/<project_name>.sublime-project)") do |fname|
+		subproj_file = fname
+	end
+	opts.on("-b", "--build-path PATH", "Base build dir") do |path|
+		build_path = path
+	end
+    opts.on("-g", "--gdb-params PARAMS", "Params to pass to SublimeGDB") do |params|
+        gdb_params = params
+    end
+end.parse!
+
+writer = Lace::SublProjectFileWriter.new(project_file, ARGV,build_path)
+if not writer.project
+	puts "Could not load project"
+	exit 1
+end
+writer.build_path = build_path || writer.project.path + "build"
+target_name = subproj_file ? subproj_file : "#{writer.build_path}/#{writer.project.name}.sublime-project"
+writer.gdb_params = gdb_params
+writer.write(target_name,jobs)

@@ -1,0 +1,228 @@
+#!/usr/bin/env ruby
+
+# The <tt>lace-vcproj</tt> command creates a Visual Studio project file from a
+# Lace project definition. This VC project file will be set up to build using
+# the +lace+ command.
+#
+# Usage:
+#
+#   create_vcproject.rb [OPTIONS] BUILD_TARGET1 [BUILD_TARGET2 [...]]
+#
+# Options:
+#
+#   -p, --project PROJECT_FILE     The project file to read (default: project.lace)
+#   -o, --output VCPROJ_FILENAME   The filename of the resulting .vcproj file
+#                                  (default: build/<project_name>.vcproj)
+#   -v, --vcversion VERSION        The version number of the resulting .vcproj file.
+#                                  Choose from 7.10 (default), 8.00 or 9.00
+#   -j, --jobs NUM_JOBS            Number of compile jobs to execute in parallel
+#                                  (Defaults to the NUMBER_OF_PROCESSORS environment var.)
+
+# Copyright (c) 2009 keen games
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+require 'open3'
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+
+module Lace
+	class VCProjectFileWriter < ProjectFileWriterBase
+
+		def make_local(path)
+			Helpers.make_relative(path).gsub(/\//, '\\')
+		end
+
+		def write(filename, version, jobs)
+			defbuild = to_path(__FILE__).dirname + 'defbuild.rb'
+			open_file(filename) do |file|
+				project_name = @project.name
+				project_guid = @project.globals.vcproj_guid || '{955F73E0-6CC7-3213-8A61-FC349BCF0D03}'
+
+				include_key_word = (version == '9.00' ? " IncludeSearchPath=\"" : " AdditionalIncludeDirectories=\"")
+
+				file.puts "<?xml version=\"1.0\" encoding=\"Windows-1252\"?>\n<VisualStudioProject ProjectType=\"Visual C++\"	Version=\"#{version}\" Name=\"#{project_name}\" ProjectGUID=\"#{project_guid}\" Keyword=\"MakeFileProj\">"
+
+				# add platforms to the project file.
+				file.puts "\t<Platforms>\n"
+				platforms = []
+				@builds.each do |build|
+					build_platform = get_attribute(:vcproj_platform, build)
+					platforms << (build_platform.first || "Win32").to_s
+				end
+
+				platforms = platforms.uniq
+				platforms.each do |platform|
+					file.puts "\t\t<Platform Name=\"#{platform}\"/>\n"
+				end
+				file.puts "\t</Platforms>"
+
+				file.puts "\t<Configurations>"
+				@builds.each do |build|
+					project = find_project(build)
+					target_dir = make_local(project.build_path)
+					build_cmd = build_command(build, jobs,"&quot;")
+					platform = get_attribute(:vcproj_platform, build).first || "Win32"
+
+					executable_filename = make_local(get_build_executable_path( build ) )
+
+					file.puts "\t\t<Configuration Name=\"#{build.gsub(/\//, '_')}|#{platform}\" OutputDirectory=\"#{target_dir}\" IntermediateDirectory=\"#{target_dir}\" ConfigurationType=\"0\">"
+					file.write "\t\t\t<Tool Name=\"VCNMakeTool\" BuildCommandLine=\"#{build_cmd} build\" ReBuildCommandLine=\"#{build_cmd} -r\" CleanCommandLine=\"#{build_cmd} -c\" Output=\"#{executable_filename}\""
+
+					include_dirs = get_attribute(:cpp_include_dir, build)
+					unless include_dirs.empty?
+						file.write include_key_word
+						file.write include_dirs.map {|einc| make_local(einc)}.join(';')
+						file.write "\""
+					end
+					file.puts "/>"
+
+					configuration_tags = get_attribute(:vcproj_config_tags, build)
+
+					configuration_tags.each do |tag|
+						file << tag.call(find_project(build))
+					end
+
+					file.puts "\t\t</Configuration>"
+				end
+				
+				file.puts "\t</Configurations>"
+				
+				file.puts "\t<Files>"
+				
+				filenames = get_files
+	
+				# now put all the files...
+
+				# first, recreate the folder structure of the files. We do it the following way : we split a folder from the beginning of the pathname. We check a hash for the given folder.
+				# if its not there, we put it there, we put another hash in the hash for the folders in there.
+				# if we, however, find a filename, we put it into an array that is in the hash under the name of '.'
+				# after that, we get the keys of the hash, sort the list of keys and output the data recursiveley (done in write_folders).
+
+				folders = {}
+				folders["."] = []	# the files here
+
+				# now make relativ paths from the filenames
+				filenames = filenames.map {|filename| make_local(filename) }
+
+				# create a hash holding an array for all files in that folder and another hash for each directory.
+				filenames.each do |filename|
+					namefolders = filename.split(/\/|\\/)
+					basename = namefolders.pop
+					while namefolders.at(0) == ".."
+						namefolders.shift
+					end
+					currenthash = folders
+					namefolders.each do |f|
+						if (not currenthash[f])
+							currenthash[f] = {}
+						end
+						currenthash = currenthash[f]
+					end
+					
+					if (not currenthash["."])
+						currenthash["."] = []
+					end
+					currenthash["."] << filename
+				end
+
+				# now recurse through the hashes that each represent a folder
+				write_folders(file, folders, 2)
+
+				file << "\t</Files>\n"
+
+				file << "\t<Globals>\n\t</Globals>\n"
+
+				file << "</VisualStudioProject>"
+			end
+		end
+		
+		def write_folders(output, folderhash, indent)
+
+			folders = folderhash.keys.sort
+			# make sure the folders appear in front of the files.
+			top = folders.at(0)
+			if (top and top == ".")
+				folders.push(folders.shift)
+			end
+
+			folders.each do |folder|
+				if (folder == ".")
+					filenames = folderhash[folder].sort
+					filenames.each do |filename|
+						output << ?\t.chr * (indent+1)
+						output << "<File RelativePath=\"" + filename.gsub(/\//, '\\') + "\"/>\n"
+					end
+				else
+					output << ?\t.chr * (indent+1)
+					output << "<Filter Name=\"#{folder}\" Filter=\"\">\n"
+					write_folders(output, folderhash[folder], indent+1)
+					output << ?\t.chr * (indent+1)
+					output << "</Filter>\n"
+				end
+			end
+		end
+	end
+end
+
+project_file = 'project.lace'
+vcproj_file = nil
+vcproj_version = ENV['LACE_VCPROJ_VERSION'] || '10.00'
+vcproj_jobs = ENV['NUMBER_OF_PROCESSORS'] || '1'
+build_path = nil
+
+if( vcproj_version == '10.00' || vcproj_version == '11.00' || vcproj_version == '12.00' || vcproj_version == '14.00' )
+	# run create_vcxproj instead:
+	puts 'Creating Visual Studio 2010 Project files'
+	vcxproj_script = File.dirname(__FILE__) + '/lace-vcxproj'	
+	load vcxproj_script
+	exit 0
+end
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: create_vcproject.rb [OPTIONS] [BUILDS]"
+	opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+		project_file = fname
+	end
+	opts.on("-o", "--output VCPROJ_FILENAME", "The filename of the resulting .vcproj file (default: build/<project_name>.vcproj)") do |fname|
+		vcproj_file = fname
+	end
+	opts.on("-v", "--vcversion VERSION", "The version number of the resulting .vcproj file. Choose from 7.10 (default), 8.00 or 9.00") do |version|
+		unless version == "7.10" || version == "8.00" || version == "9.00"
+			puts "Error: illegal version number selected (valid : 7.10, 8.00, 9.00)"
+			exit 1
+		end
+		vcproj_version = version
+	end
+	opts.on("-j", "--jobs NUM_JOBS", Integer, "Number of compile jobs to execute in parallel") do |jobs|
+		vcproj_jobs = jobs
+	end
+	opts.on("-b", "--build-path PATH", "Base build dir") do |path|
+		build_path = path
+	end
+end.parse!
+
+writer = Lace::VCProjectFileWriter.new(project_file, ARGV,build_path)
+writer.build_path = build_path || writer.project.path + "build"
+target_name = vcproj_file ? vcproj_file : "#{writer.build_path}/#{writer.project.name}.vcproj"
+writer.write(target_name, vcproj_version, vcproj_jobs)

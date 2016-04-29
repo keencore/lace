@@ -1,0 +1,226 @@
+#!/usr/bin/env ruby
+
+# The +lace+ command lets you build, rebuild or clean a project. See the Lace README for more
+# information about lace project definition files.
+#
+# The +lace+ command has the following general form:
+#
+#   lace [OPTIONS] [PROJECT_DEFINITION_FILE]
+#
+# If no PROJECT_DEFINITION_FILE is given at the command line, the file "project.lace" in the
+# current directory is implied.
+#
+# The following options are avaiable:
+#
+#   -b, --build BUILD      Specifies the build target
+#   -j, --jobs NUM_JOBS    Number of compile jobs to execute in parallel
+#   -c, --clean            Clean build directory
+#   -r, --rebuild          First clean build directory, then build
+#
+# Note that the --jobs option only really works with ruby >= 1.9, as previous ruby versions
+# did not support native threads.
+
+# Copyright (c) 2009 keen games
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+# change this to trigger a rebuild of all (!) projects
+lace_version = 46
+
+startTime = Time.now.to_f
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'optparse'
+require 'pathname'
+require 'lace/project'
+require 'lace/builder'
+require 'lace/remote_builder'
+require 'lace/config'
+
+$stdout.sync = true
+
+build = ''
+num_jobs = Lace::Helpers.numCPUs
+clean = false
+build_path = nil
+skip_remote_build = false
+skip_invalid_targets = false
+keep_dirs = []
+
+def build_project( project_filename, build, build_path, clean, num_jobs, skip_remote_build, skip_invalid_targets, lace_version, keep_dirs )
+
+	# load the config:
+	config = Lace::Config.load Pathname.new( __FILE__ ).realdirpath
+	raise "No lace-config.json found" if not config
+
+	project = Lace::Project.load(project_filename, config, build.split('/'), build_path, skip_invalid_targets )
+
+	keep_dirs.each { |kd|
+		project.global_context.add_attribute :sticky_build_directories, kd.to_s
+	}
+
+	if project.is_remote_build
+		if skip_remote_build
+			puts "Skipping remote build #{build}"
+			return
+		end
+		builder = Lace::RemoteBuilder.new config, project_filename
+		builder.sync_source(project)
+
+		if clean
+			puts "cleaning remote project #{project.name} (#{build})"
+			builder.clean(project)
+		end
+
+		if !clean || clean == :rebuild
+			puts "building remote project #{project.name} (#{build})"
+			builder.build(project)
+		end
+	else
+		# local build
+		project_lace_version_filename = project.build_path + "lace_version.txt"
+
+		if File.exist?( project_lace_version_filename ) 
+			project_lace_version = File.read( project_lace_version_filename )
+			if project_lace_version.to_i != lace_version
+				if !clean
+					clean = :rebuild
+					puts "Lace version changed from #{project_lace_version} to #{lace_version}, trigger rebuild"
+				end
+			end
+		else
+			# fist build ever: 
+			if !clean
+				clean = :rebuild
+			end
+		end
+
+		builder = Lace::Builder.new
+
+		if clean
+			puts "cleaning project #{project.name} (#{build})"
+			builder.clean(project)
+		end
+
+		if !clean || clean == :rebuild
+			puts "building project #{project.name} (#{build})"
+
+			unless File.directory?(File.dirname( project_lace_version_filename ))
+				FileUtils.mkdir_p(File.dirname( project_lace_version_filename ))
+			end
+			File.write( project_lace_version_filename, "#{lace_version}" );
+
+			builder.build(project, num_jobs)
+		end
+	end
+end
+
+def parseRubyExceptionMessage( message )
+	return message.gsub( /:([0-9]+):/, '(\1):' )
+end
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: lace [OPTIONS] [PROJECT_LACE]"
+	opts.on("-b", "--build BUILD", "Specifies the build") do |b|
+		build = b
+	end
+	opts.on("-k", "--keep directory", "Keep a directory inside the build folder (sticky folder)") do |k|
+		keep_dirs << k
+	end
+	opts.on("-j", "--jobs NUM_JOBS", Integer, "Number of compile jobs to execute in parallel") do |jobs|
+		num_jobs = jobs
+	end
+	opts.on("-c", "--clean", "Clean build directory") do
+		clean = true
+	end
+	opts.on("-r", "--rebuild", "First clean build directory, then build") do
+		clean = :rebuild
+	end
+	opts.on("-s", "--skip-remote-builds", "Skip remote build targets") do
+		skip_remote_build = true
+	end
+	opts.on("-i", "--skip-invalid-targets", "Skip invalid build targets") do
+		skip_invalid_targets = true
+	end
+	opts.on("-l", "--log LEVEL", "Write logfile with logging level DEBUG, INFO, WARN, ERROR or FATAL") do |level|
+		require 'logger'
+		$log = Logger.new('lace.log')
+		$log.level = case level.downcase
+			when 'debug'; Logger::DEBUG
+			when 'info'; Logger::INFO
+			when 'warn'; Logger::WARN
+			when 'error'; Logger::ERROR
+			when 'fatal'; Logger::FATAL
+			else
+				printf "Unknown logging level '%s'\n", level
+				exit 1
+		end
+	end
+	opts.on("-p", "--build-path PATH", "Base build dir") do |path|
+		build_path = path
+	end
+end.parse!
+
+project_filename = ARGV.shift || 'project.lace'
+
+#num_jobs = 1
+
+if build == "all"
+	builds = Lace::Project.get_available_build_tags(project_filename)
+
+	puts "building all configurations: #{builds.join(', ')}"
+
+	exceptionCatched = false
+	builds.each do |build_config|
+		begin
+			build_project( project_filename, build_config, build_path, clean, num_jobs, skip_remote_build, skip_invalid_targets, lace_version, keep_dirs )
+		rescue SystemExit => e
+			if( ! e.success? )
+				puts "ERROR: " + parseRubyExceptionMessage(e.to_s + "\n" + e.backtrace.join("\n"))
+				exceptionCatched = true
+			end
+		rescue Exception => e
+			puts "ERROR: " + parseRubyExceptionMessage(e.to_s + "\n" + e.backtrace.join("\n"))
+			exceptionCatched = true
+		end
+	end
+
+	if exceptionCatched then
+		exit 1
+	end
+else
+	begin
+		build_project( project_filename, build, build_path, clean, num_jobs, skip_remote_build, skip_invalid_targets, lace_version, keep_dirs )
+	rescue SystemExit => e
+		if( ! e.success? )
+			puts "ERROR: " + parseRubyExceptionMessage(e.to_s + "\n" + e.backtrace.join("\n"))
+			exit 1
+		end
+	rescue Exception => e
+		puts "ERROR: " + parseRubyExceptionMessage(e.to_s + "\n" + e.backtrace.join("\n"))
+		exit 1
+	end
+end
+
+endTime = Time.now.to_f
+endTimeString = Time.now.strftime( '%H:%M:%S' )
+
+puts 'Build finished in ' + ( endTime - startTime ).round( 1 ).to_s + "s at #{endTimeString}" if not build.empty?

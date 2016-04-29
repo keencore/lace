@@ -1,0 +1,140 @@
+#!/usr/bin/env ruby
+
+# This creates a doxyfile to drive Doxygen from a Lace project definition.
+#
+# Usage:
+#
+#   lace-doxyfile [OPTIONS] BUILDS_TARGET
+#
+# Options:
+#
+#   -p, --project PROJECT_FILE       The project file to read (default: project.lace)
+#   -o, --output doxyfilename        The filename of the resulting doxyfile(default: build/<target>/<project_name>.doxyfile)
+#
+# Note that while this command works well enough, it is still very much work in progress.
+
+
+# Copyright (c) 2009 keen games
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+
+module Lace
+	class DoxyFileWriter < ProjectFileWriterBase
+		def make_local(path)
+			Helpers.make_relative(path).gsub(/\//, '\\')
+		end
+
+		def make_global(path)
+			to_path(path).to_s.gsub('\/', '\\')
+		end
+
+		def write(filename)
+			
+			doxyfilepath = to_path(File.dirname(filename))
+
+			open_file(filename) do |file|
+				
+				# first, output files that should be imported here (configuration files etc.)
+
+				import_files = @project.globals.doxygen_import_files || nil
+				if (import_files)
+					import_files = [import_files] unless import_files.kind_of? Array
+					file << import_files.map {|f| '@INCLUDE = ' + make_global(f) }.join("\n") + "\n"
+				end
+
+				file << "OUTPUT_DIRECTORY = #{make_global(doxyfilepath)} \n"
+
+				project_name = @project.name
+
+				files = []
+				@projects.each do |project|
+					files.concat(project.files)
+				end
+
+				files = files.uniq
+
+				# take all files out that are logically external references (.htm, .html, .chm, .pdf)
+
+				external_references = files.select{ |f| f.tags.include?('.htm') || f.tags.include?('.html') || f.tags.include?('.chm') || f.tags.include?('.pdf')}
+				files = files - external_references
+
+				ignored_files = files.select{ |f| f.tags.include?('.dll') || f.tags.include?('.fs') || f.tags.include?('.hs') || f.tags.include?('.vs') || f.tags.include?('.ds')}
+				files = files - ignored_files
+
+				if external_references.size > 0
+					external_references_filename = doxyfilepath + 'externals.dox'
+
+					open_file(external_references_filename) do |external_references_file|
+						external_references_file << "/*! This page lists all external references found within the code base.\n"
+						external_references_file << "\\page EXTERNAL_REFERNCES External References\n"
+						external_references.each do |ref|
+							ref_path = 'file://' + make_global(ref.path)
+							external_references_file << '<a target="_top" href="' + ref_path + '"> External link to ' + File.basename(ref.path) + "</a>\n\n"
+						end
+						external_references_file << "*/\n"
+						files << InputFile.new(external_references_filename, [], nil)
+					end
+				end
+
+				# now make global paths from the filenames
+				filenames = files.reject { |f| f.tags.include?('NODOXYGEN')  }.map {|f| make_global(f.path) }
+
+				# create a hash holding an array for all files in that folder and another hash for each directory.
+				filenames.each do |filename|
+					file << 'INPUT += ' + filename + "\n"
+				end
+
+			end
+		end
+
+	end
+end
+
+project_file = 'project.lace'
+doxy_file = nil
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: lace-doxyfile [OPTIONS] BUILDS_TARGET"
+	opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+		project_file = fname
+	end
+	opts.on("-o", "--output doxyfilename", "The filename of the resulting doxyfile(default: build/<target>/<project_name>.doxyfile)") do |fname|
+		doxy_file = fname
+	end
+end.parse!
+
+if ARGV.empty?
+	puts 'Error: no build target given.'
+	exit 1
+end
+
+platform = ARGV.shift
+
+writer = Lace::DoxyFileWriter.new(project_file, [platform])
+if not doxy_file
+	doxy_file = writer.project.build_path.to_s + "/#{writer.project.name}.doxyfile"
+end
+
+writer.write(doxy_file)

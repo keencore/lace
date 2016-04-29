@@ -1,0 +1,129 @@
+#!/usr/bin/env ruby
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'optparse'
+require 'lace/project'
+require 'lace/lacemodule'
+
+def count_lines( file_path )
+	return File.foreach(file_path).inject(0) {|c, line| c+1}
+end
+
+module Lace
+	LaceModule.class_eval do
+		
+		def method_missing(meth, *args, &block)
+		end
+		
+		def name
+			@module_name
+		end
+		
+		def raise( *args )
+		end
+		
+		def set_global_attribute(id, attr)
+		end
+		
+		def set_global_path(id, path)
+		end
+		
+		def add_global_path(id, *paths)
+		end
+		
+		def define_subproject(name, params = {}, &block)
+		end
+		
+		def loc
+			@loc || 0
+		end
+		
+		def add_file(glob, tags, error_mode = :error)
+			
+		end
+		
+		def count_lines( module_path )
+			@loc = 0
+			files = Dir[ "#{module_path}/**/*.*" ]
+			files.each do |filename|
+				path = to_path(filename)
+				case File.extname( path ).downcase
+				when '.cpp', '.hpp', '.ds', '.fs', '.hs', '.shader', '.cg', '.hlsl', '.protocol', '.rb', '.lace'
+					@loc += File.foreach(path).inject(0) {|c, line| c+1}
+				else
+					count = 0
+				end	
+			end			
+		end
+	end
+end
+
+module_set_path = ARGV.shift.gsub( /\\/, '/' )
+output_path = ARGV.shift
+
+fake_project_path = Pathname.new("project.lace").expand_path
+project = Lace::Project.new fake_project_path, "", [ "win32", "debug" ]
+
+module_set_pathname = Pathname.new( module_set_path )
+module_infos = []
+total_loc = 0
+
+owner_loc = {}
+
+# collect module info
+Dir[ "#{module_set_path}/**/*.lace" ].each { |module_path|
+	next if File.basename( module_path, ".lace" ) == "project"		# leave out test projects..
+	next if module_path.include? "/thirdparty/" 					# leave out third party modules
+	
+	module_name = File.dirname( Pathname.new( module_path ).relative_path_from( module_set_pathname ) )
+	
+	module_info = project.read_module module_path, nil, :all, module_name
+	
+	module_info.count_lines Pathname.new( File.dirname( module_path ) ).realpath.to_s
+
+	if module_info.loc == 0
+		puts "Skipping module #{module_info.name} - loc is 0!"
+		next
+	end
+	
+	if not module_info.owners.empty?
+		module_info.owners.each { |owner| 
+			current_owner_loc = owner_loc[ owner ] || 0
+			current_owner_loc += module_info.loc
+			owner_loc[ owner ] = current_owner_loc
+		}
+	else
+		owner_loc[ "{color:red}nobody{color}" ] = ( owner_loc[ "{color:red}nobody{color}" ] || 0 ) + module_info.loc
+	end
+	
+	module_infos << module_info
+	total_loc += module_info.loc
+}
+
+# encode into wiki markup:
+output_content = "h2. #{module_set_path} (Total LOC:#{total_loc})\n\n||module||owner||lines of code||\n"
+
+module_infos.each { |module_info|	
+	if module_info.owners.size == 1
+		owner_string = module_info.owners[ 0 ]
+	elsif not module_info.owners.empty?
+		owner_string = module_info.owners.join("\\\\")
+	else
+		owner_string = "{color:red}nobody{color}"
+	end
+	module_content = "|#{module_info.name}|#{owner_string}|#{module_info.loc}|\n"
+	output_content += module_content
+}
+
+output_content += "\n\n"
+
+output_content += "||owner||lines of code||\n"
+
+owner_loc.sort_by {|k, v| -v}.each { |owner,loc|
+	owner_content = "|#{owner}|#{loc}|\n"
+	output_content += owner_content
+}
+
+File.open( output_path, "w" ) { |file| file.write( output_content ) }

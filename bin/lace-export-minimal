@@ -1,0 +1,38 @@
+#!/usr/bin/env ruby1.9.1
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'set'
+require 'lace/project'
+require 'lace/builder'
+require 'lace/dependencies'
+require 'fileutils'
+
+files = Set.new
+
+basedir = Dir.pwd + '/'
+
+for build in ARGV
+	project_dir, build = build.split(':', 2)
+	project = Lace::Project.load(project_dir + '/project.lace', build.split('/'))
+	builder = Lace::Builder.new
+	builder.build(project)
+	files += project.used_files
+	srcs = project.files.map {|f| f.path.expand_path.to_s }
+	files += srcs
+	
+	for filename in Dir[project_dir + '/build/' + build + '/**/*.d']
+		deps = File.read(filename) =~ /\|/ ? Lace::Dependencies.load_lace_dependencies(filename) : Lace::Dependencies.load_make_dependencies(filename)
+		files += deps.inputs.map {|d| File.expand_path(d, project_dir) }.select {|d| d[0, basedir.size] == basedir && d !~ /\/build\// && File.exist?(d) }
+	end
+end
+
+target_dir = 'export/'
+for file in files
+	target = file.dup
+	target[0, basedir.size] = target_dir
+	FileUtils.mkpath(File.dirname(target))
+	FileUtils.cp(file, target)
+end
+

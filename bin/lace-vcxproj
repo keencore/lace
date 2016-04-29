@@ -1,0 +1,539 @@
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+
+module Lace
+	class MSBuildProjectFileWriter < ProjectFileWriterBase
+
+		def make_local(path)
+			Helpers.make_relative(path).gsub(/\//, '\\')
+		end
+
+		def compare_platforms( platform_a, platform_b )
+			if platform_a == platform_b
+				return 0
+			elif if platform_b == "ps4"
+				return -1
+			elif if platform_a == "ps4"
+				return 1
+			else
+				return platform_a <=> platform_b
+			end
+		end
+
+		def is_uwp_config( configuration_name )
+			return configuration_name.start_with? 'uwp'
+		end
+
+		def is_android_arm_config( configuration_name )
+			return configuration_name.start_with? 'android_arm'
+		end
+
+		def get_android_tegra_configuration_name( configuration_name )
+			return 'android_tegra_' + configuration_name[8..-1]
+		end
+
+		def is_android_arm_build( build )
+			project = find_project(build)
+			platform = get_attribute(:vcproj_platform, build).first || "Win32"
+			configuration_name = build.gsub(/\//, '_')
+			return is_android_arm_config( configuration_name )
+		end
+
+		def is_debug_config( configuration_name )
+			return configuration_name.end_with? 'debug'
+		end
+
+		def get_platform( build, write_uwp )
+			project = find_project(build)
+			platform = get_attribute(:vcproj_platform, build).first || "Win32"
+
+			if !write_uwp
+				platform = "Win32"
+			end
+
+			return platform;
+		end
+
+		def remove_platform_from_configuration( configuration_name )
+			configuration_name = configuration_name.gsub('_arm32_', '_')
+			configuration_name = configuration_name.gsub('_arm64_', '_')
+			configuration_name = configuration_name.gsub('_x86_', '_')
+			configuration_name = configuration_name.gsub('_x64_', '_')
+
+			return configuration_name
+		end
+
+		def write(filename, jobs, write_tegra, write_uwp, vcproj_version)
+
+			keep_dirs = ["intermediate"]
+
+			# sort builds to have the ps4 builds first (if any)
+			sorted_builds = @builds.sort { |a, b|
+				platform_a = get_attribute(:vcproj_platform, a).first || "Win32"
+				platform_b = get_attribute(:vcproj_platform, b).first || "Win32"
+				compare_platforms( platform_a, platform_b )
+			}
+
+			open_file(filename) do |file|
+				project_name = @project.name
+				project_guid = @project.globals.vcproj_guid || '{955F73E0-6CC7-3213-8A61-FC349BCF0D03}'
+
+				include_key_word = "NMakeIncludeSearchPath"
+
+				file.puts "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+				file.puts "<Project DefaultTargets=\"Build\" ToolsVersion=\"4.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">"
+
+				if write_tegra
+					file.puts "\t<PropertyGroup Label=\"NsightTegraProject\">"
+					file.puts "\t\t<NsightTegraProjectRevisionNumber>11</NsightTegraProjectRevisionNumber>"
+					file.puts "\t</PropertyGroup>"
+				end
+
+				# add project configurations to the project file.
+				file.puts "\t<ItemGroup Label=\"ProjectConfigurations\">"
+
+				if write_tegra
+					sorted_builds.each do |build|
+						project = find_project(build)
+						platform = get_platform(build, write_uwp)
+						configuration_name = build.gsub(/\//, '_')
+
+						if is_android_arm_config( configuration_name )
+							tegra_configuration_name = get_android_tegra_configuration_name( configuration_name )
+							file.puts "\t\t<ProjectConfiguration Include=\"#{tegra_configuration_name}|Tegra-Android\">\n"
+							file.puts "\t\t<Configuration>#{tegra_configuration_name}</Configuration>\n"
+							file.puts "\t\t<Platform>Tegra-Android</Platform>\n"
+							file.puts "\t\t</ProjectConfiguration>\n"
+						end
+					end
+				else
+					sorted_builds.each do |build|
+						project = find_project(build)
+						platform = get_platform(build, write_uwp)
+						configuration_name = build.gsub(/\//, '_')
+
+						if write_uwp
+							if is_uwp_config( build )
+								configuration_name = remove_platform_from_configuration( configuration_name )
+							else
+								next
+							end
+						end
+
+						file.puts "\t\t<ProjectConfiguration Include=\"#{configuration_name}|#{platform}\">\n"
+						file.puts "\t\t\t<Configuration>#{configuration_name}</Configuration>\n"
+						file.puts "\t\t\t<Platform>#{platform}</Platform>\n"
+						file.puts "\t\t</ProjectConfiguration>\n"
+					end
+				end
+
+				file.puts "\t</ItemGroup>"
+
+				vcproj_version_formatted = 'v' + vcproj_version.delete('.')[0..2];
+
+				file.puts "\t<PropertyGroup Label=\"Globals\">\n"
+				file.puts "\t\t<ProjectGuid>#{project_guid}</ProjectGuid>\n"
+				file.puts "\t\t<PlatformToolset>#{vcproj_version_formatted}</PlatformToolset>\n"
+
+				if !write_uwp
+					file.puts "\t\t<Keyword>MakeFileProj</Keyword>\n"
+				else
+					file.puts "\t\t<RootNamespace>#{@project.name}</RootNamespace>\n"
+					file.puts "\t\t<ApplicationType>Windows Store</ApplicationType>\n"
+					file.puts "\t\t<AppContainerApplication>true</AppContainerApplication>\n"
+					file.puts "\t\t<ApplicationType>Windows Store</ApplicationType>\n"
+					file.puts "\t\t<WindowsTargetPlatformVersion>10.0.10586.0</WindowsTargetPlatformVersion>\n"
+					file.puts "\t\t<WindowsTargetPlatformMinVersion>10.0.10240.0</WindowsTargetPlatformMinVersion>\n"
+					file.puts "\t\t<ApplicationTypeRevision>10.0</ApplicationTypeRevision>\n"
+				end
+
+				file.puts "\t</PropertyGroup>\n"
+
+				file.puts "\t<Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.Default.props\" />\n"
+
+				sorted_builds.each do |build|
+					project = find_project(build)
+					platform = get_platform(build, write_uwp)
+					configuration_name = build.gsub(/\//, '_')
+
+					target_dir = make_local(project.build_path)
+					build_cmd = build_command(build, jobs,"&quot;",keep_dirs)
+
+					executable_extension = get_attribute(:vcproj_executable_extension, build).first || ".exe"
+					executable_base_filename = get_attribute(:executable_basename,build).first || (@project.globals.target_name || @project.name)
+					executable_namer = get_attribute(:executable_name_creator, build).first
+					executable_filename = executable_namer ? executable_namer.call(project, executable_base_filename) : executable_base_filename + executable_extension
+
+					if write_tegra
+						if is_android_arm_config( configuration_name )
+							tegra_configuration_name = get_android_tegra_configuration_name( configuration_name )
+
+							build_cmd = build_command(build, jobs,"&quot;",keep_dirs)
+							target_dir = make_local(project.build_path)
+
+							file.puts "\t<PropertyGroup Label=\"Configuration\" Condition=\"'$(Configuration)|$(Platform)'=='#{tegra_configuration_name}|Tegra-Android'\">"
+							file.puts "\t\t<ConfigurationType>ExternalBuildSystem</ConfigurationType>"
+							file.puts "\t</PropertyGroup>"
+
+							file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{tegra_configuration_name}|Tegra-Android'\">"
+
+							file.puts "\t\t<NMakeBuildCommandLine>#{build_cmd}</NMakeBuildCommandLine>\n"
+							file.puts "\t\t<NMakeReBuildCommandLine>#{build_cmd} -r</NMakeReBuildCommandLine>\n"
+							file.puts "\t\t<NMakeCleanCommandLine>#{build_cmd} -c</NMakeCleanCommandLine>\n"
+
+							file.puts "\t\t<NMakePreprocessorDefinitions>"
+							file.puts "\t\t</NMakePreprocessorDefinitions>"
+							file.puts "\t\t<NMakeIncludeSearchPath>"
+							file.puts "\t\t</NMakeIncludeSearchPath>"
+							file.puts "\t\t<NMakeForcedIncludes>"
+							file.puts "\t\t</NMakeForcedIncludes>"
+							file.puts "\t\t<SdkRootPath>$(Registry:HKEY_LOCAL_MACHINE\\Software\\NVIDIA Corporation\\Nsight Tegra@sdkRoot)</SdkRootPath>"
+							file.puts "\t\t<JdkRootPath>$(Registry:HKEY_LOCAL_MACHINE\\Software\\NVIDIA Corporation\\Nsight Tegra@jdkRoot)</JdkRootPath>"
+							file.puts "\t\t<OutDir>#{target_dir}</OutDir>"
+							file.puts "\t\t<AndroidClearUserData>false</AndroidClearUserData>"
+							file.puts "\t</PropertyGroup>"
+						end
+					elsif is_uwp_config( build ) && write_uwp
+						configuration_name = remove_platform_from_configuration( configuration_name )
+
+						file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\" Label=\"Configuration\">\n"
+						file.puts "\t\t<ConfigurationType>Application</ConfigurationType>\n"
+						file.puts "\t\t<TargetName>#{project.name}</TargetName>\n"
+						file.puts "\t\t<UseDotNetNativeToolchain>true</UseDotNetNativeToolchain>\n"
+						file.puts "\t\t<UseDebugLibraries>true</UseDebugLibraries>\n" if is_debug_config( build )
+						file.puts "\t\t<LaceBuild>#{build}</LaceBuild>"
+						file.puts "\t</PropertyGroup>\n"
+					elsif !write_uwp
+						file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\" Label=\"Configuration\">\n"
+						file.puts "\t\t<ConfigurationType>Makefile</ConfigurationType>\n"
+						file.puts "\t</PropertyGroup>\n"
+					end
+				end
+
+				file.puts "\t<Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.props\" />\n"
+
+				file.puts "\t<PropertyGroup Condition=\"'$(DebuggerFlavor)'=='ORBISDebugger'\" Label=\"OverrideDebuggerDefaults\">\n"
+				file.puts "\t\t<!--LocalDebuggerCommand>$(TargetPath)</LocalDebuggerCommand-->\n"
+				file.puts "\t\t<!--LocalDebuggerCommandArguments></LocalDebuggerCommandArguments-->\n"
+				file.puts "\t\t<!--LocalDebuggerTarget></LocalDebuggerTarget-->\n"
+				file.puts "\t\t<!--LocalDebuggerWorkingDirectory>$(ProjectDir)</LocalDebuggerWorkingDirectory-->\n"
+				file.puts "\t\t<!--LocalRunCommandLine></LocalRunCommandLine-->\n"
+				file.puts "\t</PropertyGroup>\n"
+
+				file.puts "\t\t<ImportGroup Label=\"ExtensionSettings\">\n"
+				file.puts "\t</ImportGroup>\n"
+
+				if !write_tegra
+					sorted_builds.each do |build|
+						project = find_project(build)
+						platform = get_platform(build, write_uwp)
+						configuration_name = build.gsub(/\//, '_')
+
+						if write_uwp
+							if is_uwp_config( build )
+								configuration_name = remove_platform_from_configuration( configuration_name )
+							else
+								next
+							end
+						end
+
+						file.puts "\t<ImportGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\" Label=\"PropertySheets\">\n"
+						file.puts "\t\t<Import Project=\"$(UserRootDir)\\Microsoft.Cpp.$(Platform).user.props\" Condition=\"exists('$(UserRootDir)\\Microsoft.Cpp.$(Platform).user.props')\" Label=\"LocalAppDataPlatform\" />\n"
+						file.puts "\t</ImportGroup>\n"
+					end
+				end
+
+				file.puts "\t<PropertyGroup Label=\"UserMacros\" />\n"
+
+				if !write_tegra
+					sorted_builds.each do |build|
+						project = find_project(build)
+						platform = get_platform(build, write_uwp)
+						configuration_name = build.gsub(/\//, '_')
+
+						build_directory = build.gsub(/\//, '\\')
+
+						if write_uwp
+							if is_uwp_config( build )
+								configuration_name = remove_platform_from_configuration( configuration_name )
+							else
+								next
+							end
+						end
+
+						file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\">\n"
+						file.puts "\t\t<IntDir>#{build_directory}\\intermediate\\</IntDir>\n"
+						file.puts "\t\t<OutDir>#{build_directory}\\</OutDir>\n"
+						file.puts "\t</PropertyGroup>\n"
+					end
+
+					sorted_builds.each do |build|
+						project = find_project(build)
+						platform = get_platform(build, write_uwp)
+						configuration_name = build.gsub(/\//, '_')
+
+						target_dir = make_local(project.build_path)
+						build_cmd = build_command(build, jobs,"&quot;",keep_dirs)
+
+						executable_extension = get_attribute(:vcproj_executable_extension, build).first || ".exe"
+						executable_base_filename = get_attribute(:executable_basename,build).first || (@project.globals.target_name || @project.name)
+						executable_namer = get_attribute(:executable_name_creator, build).first
+						executable_filename = executable_namer ? executable_namer.call(project, executable_base_filename) : executable_base_filename + executable_extension
+
+						if is_uwp_config( build ) && write_uwp
+							configuration_name = remove_platform_from_configuration( configuration_name )
+							include_dirs = get_attribute(:cpp_include_dir, build).map {|einc| make_local(einc)}.join(';')
+							libs = get_attribute(:libs).join(';')
+
+							file.puts "\t<ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\">\n"
+							file.puts "\t\t<ClCompile>\n"
+							file.puts "\t\t\t<PrecompiledHeader>NotUsing</PrecompiledHeader>\n"
+							file.puts "\t\t\t<PreprocessorDefinitions>#{get_attribute(:cpp_define, build).join(';')}</PreprocessorDefinitions>\n"
+							file.puts "\t\t\t<AdditionalIncludeDirectories>#{include_dirs}</AdditionalIncludeDirectories>\n"
+							file.puts "\t\t</ClCompile>\n"
+							file.puts "\t\t<Link>\n"
+							file.puts "\t\t\t<AdditionalDependencies>#{libs}</AdditionalDependencies>\n"
+							file.puts "\t\t\t<AdditionalLibraryDirectories></AdditionalLibraryDirectories>\n"
+							file.puts "\t\t</Link>\n"
+							file.puts "\t</ItemDefinitionGroup>\n"
+						elsif !write_uwp
+							file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\">\n"
+							file.puts "\t\t<NMakeBuildCommandLine>#{build_cmd}</NMakeBuildCommandLine>\n"
+							file.puts "\t\t<NMakeReBuildCommandLine>#{build_cmd} -r</NMakeReBuildCommandLine>\n"
+							file.puts "\t\t<NMakeCleanCommandLine>#{build_cmd} -c</NMakeCleanCommandLine>\n"
+							file.puts "\t\t<NMakeOutput>#{target_dir}\\#{executable_filename}</NMakeOutput>\n"
+							file.puts "\t\t<NMakePreprocessorDefinitions>#{get_attribute(:cpp_define, build).join(';')}</NMakePreprocessorDefinitions>\n"
+							file.write "\t\t<NMakeIncludeSearchPath>"
+							include_dirs = get_attribute(:cpp_include_dir, build)
+							unless include_dirs.empty?
+								file.write include_dirs.map {|einc| make_local(einc)}.join(';')
+							end
+							file.puts "</NMakeIncludeSearchPath>\n"
+							file.write "\t</PropertyGroup>\n"
+						end
+					end
+				end
+
+				#file.puts "\t</PropertyGroup>\n"
+
+				file.puts "\t<ItemDefinitionGroup>\n"
+				file.puts "\t</ItemDefinitionGroup>\n"
+
+				filenames = get_files
+
+				# now make relativ paths from the filenames
+				filenames = filenames.map {|filename| make_local(filename) }
+
+				# write file list:
+				file << "\t<ItemGroup>\n"
+
+				filenames.each do |filename|
+					if is_source_file( filename )
+						include_type = "ClCompile"
+					elsif is_header_file( filename )
+						include_type = "ClInclude"
+					else
+						include_type = "None"
+					end
+
+					file << "\t\t<#{include_type} Include=\"" + filename.gsub(/\//, '\\') + "\"/>\n"
+				end
+
+				file << "\t</ItemGroup>\n"
+
+				# :JK: this line is here to load the SC VSI extension .. I'm not sure if it hurts when the extension is not installed/no ps4 target is present..
+				file.puts "\t<Import Condition=\"'$(ConfigurationType)' == 'Makefile' and Exists('$(VCTargetsPath)\\Platforms\\$(Platform)\\SCE.Makefile.$(Platform).targets')\" Project=\"$(VCTargetsPath)\\Platforms\\$(Platform)\\SCE.Makefile.$(Platform).targets\" />\n"
+				file.puts "\t<Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.targets\" />\n"
+				file.puts "\t<ImportGroup Label=\"ExtensionTargets\">\n"
+				file.puts "\t</ImportGroup>\n"
+
+				if write_uwp
+					uwp_build_cmd = build_command(sorted_builds.first, jobs, "",keep_dirs).gsub('-b ' + sorted_builds.first, '-b $(LaceBuild)')
+					file.puts "\t<Target Name=\"Build\" Condition=\"'$(ConfigurationType)' == 'Application'\" Outputs=\"$(TargetPath)\" DependsOnTargets=\"_PrepareForBuild\">\n"
+					file.puts "\t\t<Exec Command=\"#{uwp_build_cmd}\" />\n"
+					file.puts "\t</Target>\n"
+					file.puts "\t<Target Name=\"Clean\" Condition=\"'$(ConfigurationType)' == 'Application'\" DependsOnTargets=\"$(CleanDependsOn)\">\n"
+					file.puts "\t\t<Exec Command=\"#{uwp_build_cmd} -c\" />\n"
+					file.puts "\t</Target>\n"
+				end
+
+				file.puts "</Project>\n"
+			end
+
+			if write_tegra
+				user_basename = '../' + filename.basename.to_s + '.user'
+				user_filename = filename + user_basename
+
+				open_file( user_filename ) do |file|
+					file.puts "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+					file.puts "<Project ToolsVersion=\"12.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">"
+
+					sorted_builds.each do |build|
+						project = find_project(build)
+						configuration_name = build.gsub(/\//, '_')
+						executable_base_filename = get_attribute(:executable_basename,build).first || (@project.globals.target_name || @project.name)
+						target_apk_string = ( project.build_path + executable_base_filename ).to_s
+
+						if is_android_arm_config( configuration_name )
+							tegra_configuration_name = get_android_tegra_configuration_name( configuration_name )
+
+							file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{tegra_configuration_name}|Tegra-Android'\">"
+							file.puts "\t\t<OverrideAPKPath>#{target_apk_string}.apk</OverrideAPKPath>"
+							file.puts "\t\t<DebuggerFlavor>AndroidDebugger</DebuggerFlavor>"
+							file.puts "\t\t<AndroidAttach>True</AndroidAttach>"
+							file.puts "\t\t<BuildXmlPath>$(ProjectDir)</BuildXmlPath>"
+							file.puts "\t\t<GdbSetupPath />"
+							file.puts "\t\t<AdditionalLibraryDirectories />"
+							file.puts "\t\t<AdditionalGdbDirectories />"
+							file.puts "\t\t<JavaClassesDir />"
+							file.puts "\t\t<JavaSourceDir />"
+							file.puts "\t</PropertyGroup>"
+						end
+					end
+
+					file.puts "</Project>\n"
+				end
+			end
+
+			filter_basename = '../' + filename.basename.to_s + '.filters'
+			filter_filename = filename + filter_basename
+
+			open_file(filter_filename) do |file|
+
+				file.puts "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+				file.puts "<Project ToolsVersion=\"4.0\" xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">"
+
+				filenames = get_files
+
+				# collect .cpp/.hpp and other files:
+				# :TODO: use tags for this..
+
+				# now make relativ paths from the filenames
+				filenames = filenames.map {|filename| make_local(filename) }
+
+				source_files = []
+				header_files = []
+				other_files = []
+
+				filter_ids = {}
+
+				# put each file into the correct hash:
+				filenames.each do |filename|
+					# strip leading '../'
+					namefolders = get_filter_folder_list( filename )
+
+					# now we have to add all base paths up to the final one:
+					for i in 0 .. namefolders.size - 1 do
+						folder_name = i == 0 ? namefolders.at(0) : folder_name + '\\' + namefolders.at( i )
+
+						if (not filter_ids[ folder_name ] )
+							# this is not a real guid.. but who cares..
+							filter_ids[ folder_name ] = 'f325e77a-a9cb-44cb-90c1-%012x' % filter_ids.size
+						end
+					end
+
+					if is_source_file( filename )
+						source_files << filename
+					elsif is_header_file( filename )
+						header_files << filename
+					else
+						other_files << filename
+					end
+				end
+
+				# write the files:
+				write_file_item_group( file, source_files, 1, 'ClCompile' )
+				write_file_item_group( file, header_files, 1, 'ClInclude' )
+				write_file_item_group( file, other_files, 1, 'None' )
+
+				# write all filters:
+				file.puts "\t<ItemGroup>\n"
+				filter_ids.each do |filter_name,filter_uuid|
+					file.puts "\t\t<Filter Include=\"#{filter_name}\">\n"
+					file.puts "\t\t\t<UniqueIdentifier>#{filter_uuid}</UniqueIdentifier>\n"
+					file.puts "\t\t</Filter>\n"
+				end
+				file.puts "\t</ItemGroup>\n"
+
+				file.puts "</Project>\n"
+			end
+		end
+
+		def is_source_file(filename)
+			source_file_extensions = [ '.cpp', '.c', '.asm', '.s', '.cxx' ]
+			source_file_extensions.include?( File.extname( filename ) )
+		end
+
+		def is_header_file(filename)
+			header_file_extensions = [ '.hpp', '.h', '.inl', '.hxx' ]
+			header_file_extensions.include?( File.extname( filename ) )
+		end
+
+		def get_filter_folder_list( filename )
+			namefolders = filename.split(/\/|\\/)
+			basename = namefolders.pop
+			while namefolders.at(0) == ".."
+				namefolders.shift
+			end
+			return namefolders
+		end
+
+		def write_file_item_group(file, filenames, indent, prefix)
+
+			file << ?\t.chr * (indent) << "<ItemGroup>\n"
+			filenames.each do |filename|
+				namefolders = get_filter_folder_list( filename )
+				filter_name = namefolders.join( '\\' )
+
+				file << ?\t.chr * (indent+1) << '<' + prefix + " Include=\"" + filename + "\">\n"
+				file << ?\t.chr * (indent+2) << "<Filter>" + filter_name + "</Filter>\n"
+				file << ?\t.chr * (indent+1) << "</" + prefix + ">\n"
+			end
+
+			file << ?\t.chr * (indent) << "</ItemGroup>\n"
+		end
+	end
+end
+
+project_file = 'project.lace'
+vcproj_file = nil
+vcproj_version = ENV['LACE_VCPROJ_VERSION'] || '10.00'
+vcproj_jobs = ENV['NUMBER_OF_PROCESSORS'] || '1'
+vcproj_tegra = false
+vcproj_uwp = false
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: create_vcxproject.rb [OPTIONS] [BUILDS]"
+	opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+		project_file = fname
+	end
+	opts.on("-o", "--output VCXPROJ_FILENAME", "The filename of the resulting .vcproj file (default: build/<project_name>.vcxproj)") do |fname|
+		vcproj_file = fname
+	end
+	opts.on("-j", "--jobs NUM_JOBS", Integer, "Number of compile jobs to execute in parallel") do |jobs|
+		vcproj_jobs = jobs
+	end
+	opts.on("-t", "--tegra", "Create Andoird tegra targets") do |jobs|
+		vcproj_tegra = true
+	end
+	opts.on("-u", "--uwp", "Create Universal Window Platform project") do |jobs|
+		vcproj_uwp = true
+	end
+end.parse!
+
+if vcproj_tegra && vcproj_uwp
+	raise '--tegra and --uwp can not be active at the same time.'
+end
+
+#puts "project_file=#{project_file}"
+name_append = ''
+name_append += '_tegra' if vcproj_tegra
+name_append += '_uwp' if vcproj_uwp
+
+writer = Lace::MSBuildProjectFileWriter.new(project_file, ARGV)
+target_name = vcproj_file ? writer.project.path + "build/#{vcproj_file}.vcxproj" : writer.project.path + "build/#{writer.project.name}#{name_append}.vcxproj"
+writer.write(target_name, vcproj_jobs, vcproj_tegra, vcproj_uwp, vcproj_version)

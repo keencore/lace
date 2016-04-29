@@ -1,0 +1,98 @@
+#!/usr/bin/env ruby
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+
+module Lace
+	class CodeLiteProjectFileWriter < ProjectFileWriterBase
+		def write(filename, jobs)
+			open_file(filename) do |file|
+#				file.puts '<!DOCTYPE Project SYSTEM "http://www.slickedit.com/dtd/vse/10.0/vpj.dtd">'
+				file.puts '<?xml version="1.0" encoding="utf-8"?>'
+				file.printf "<CodeLite_Project Name=\"%s\" InternalType=\"\">\n", @project.name
+
+				file.puts "\t<Settings Type=\"Dynamic Library\">"
+
+				@builds.each do |build|
+#					defines = get_attribute(:cpp_define, build)
+#					file.printf "\t<Configuration Name=\"%s\" OutputFile=\"\" CompilerConfigName=\"\" Defines='%s'>\n", build, defines.map {|d| '"' + d + '"'}.join(' ')
+					file.printf "\t\t<Configuration Name=\"%s\" >\n", build
+					file.puts "\t\t\t<CustomBuild Enabled=\"yes\">"
+					file.printf "\t\t\t\t<BuildCommand>%s</BuildCommand>\n", build_command(build, jobs)
+
+					#~ file.printf "\t\t\t<Target Name=\"Execute\" MenuCaption=\"E&amp;xecute\" BuildFirst=\"1\" CaptureOutputWith=\"ProcessBuffer\" RunFromDir=\"%s\">", @project.build_path
+
+					#~ executable_base_filename = (@project.globals.target_name || @project.name)
+					#~ executable_namer = get_attribute(:executable_name_creator, build).first
+					#~ executable_filename = executable_namer ? executable_namer.call(@project, executable_base_filename) : executable_base_filename + '.exe'
+
+					#~ file.printf "\t\t\t\t<Exec CmdLine=\"%s\"/>\n", @project.build_path + executable_filename
+					#~ file.puts "\t\t\t</Target>"
+
+					#~ file.puts "\t\t<Includes>"
+					#~ get_attribute(:cpp_include_dir, build).each do |dir|
+						#~ file.printf "\t\t\t<Include Dir=\"%s\"/>\n", dir
+					#~ end
+					#~ file.puts "\t\t</Includes>"
+					file.puts "\t\t\t</CustomBuild>"
+					file.puts "\t\t</Configuration>"
+				end
+
+				file.puts "\t</Settings>"
+
+				filenames = get_files.map {|f| Helpers.make_relative(f) }
+				tree = {}
+				get_files.each do |filename|
+					current = tree
+					Helpers.make_relative2(filename, @project.path).split('/')[0..-2].each do |folder|
+						current = (current[folder] ||= {}) unless folder == '..'
+					end
+					(current[:files] ||= []) << filename
+				end
+
+				write_folders(file, tree, "\t")
+
+				file.puts "</CodeLite_Project>"
+			end
+		end
+		
+		def write_folders(file, tree, indent)
+			tree.keys.select{|k| tree[k].is_a?(Hash)}.sort.each do |folder|
+				file.printf "%s<VirtualDirectory Name=\"%s\">\n", indent, folder
+				write_folders(file, tree[folder], indent + "\t")
+				file.printf "%s</VirtualDirectory>\n", indent
+			end
+			(tree[:files] || []).each do |filename|
+				file.printf "%s<File Name=\"%s\"/>\n", indent, filename
+			end
+		end
+	end
+end
+
+project_file = 'project.lace'
+proj_file = nil
+proj_jobs = ENV['NUMBER_OF_PROCESSORS'] || '1'
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: create_vcproject.rb [OPTIONS] [BUILDS]"
+	opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+		project_file = fname
+	end
+	opts.on("-o", "--output CODELITE_PROJECT_FILENAME", "The filename of the resulting .project file (default: build/<project_name>.project)") do |fname|
+		proj_file = fname
+	end
+	opts.on("-j", "--jobs NUM_JOBS", Integer, "Number of compile jobs to execute in parallel") do |jobs|
+		proj_jobs = jobs
+	end
+end.parse!
+
+if ARGV.empty?
+	puts 'Error: no build targets given.'
+	exit 1
+end
+
+writer = Lace::CodeLiteProjectFileWriter.new(project_file, ARGV)
+writer.write(proj_file ? proj_file : writer.project.path + "build/#{writer.project.name}.project", proj_jobs)

@@ -1,0 +1,892 @@
+#!/usr/bin/env ruby
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+
+module Lace
+	class ModuleGraphWriter < ProjectFileWriterBase
+
+		def make_local(path)
+			Helpers.make_relative(path).gsub(/\//, '\\')
+		end
+
+		def write(filename_prefix,exclude_module_names)
+			@builds.each do |build|
+				project = find_project(build)
+
+				# collect modules
+				module_node_map = {}
+				project.modules.each do |mod|
+					mod_name = project.get_module_display_name( mod.path )
+					mod_basename = mod.path.basename.to_s
+					mod_path = project.get_module_import_path( mod.path )
+					
+					# p project.get_module_import_path( mod.path )
+
+					if not exclude_module_names.include?( mod_basename )
+
+						mod_name = @project.name if mod_name == 'local'
+						
+						if mod_name == @project.name
+							module_node_map[ mod_name ] = { 'sections' => { 'main' => { 'require' => [], 'requiredby' => [] } }, 'path' => mod_path }
+						else
+							if mod.sections.length == 0
+								if module_node_map[ mod_name ].nil? 
+									module_node_map[ mod_name ] = { 'sections' => { 'main' => { 'require' => [], 'requiredby' => [] } }, 'path' => mod_path }
+								else
+									module_node_map[ mod_name ]['sections'][ 'main' ] = { 'require' => [], 'requiredby' => [] }
+								end
+							else
+								mod.sections.each do |mod_section|
+									if module_node_map[ mod_name ].nil? 
+										module_node_map[ mod_name ] = { 'sections' => { mod_section[0] => { 'require' => [], 'requiredby' => [] } }, 'path' => mod_path }
+									else
+										module_node_map[ mod_name ]['sections'][ mod_section[0] ] = { 'require' => [], 'requiredby' => [] }
+									end
+								end 
+								if (!module_node_map[ mod_name ]['sections']['main'])
+									module_node_map[ mod_name ]['sections']['main'] = {'require' => [], 'requiredby' => []}
+								end									
+							end		
+						end
+					end
+				end
+
+				# collect module dependencies
+				project.modules.each do |mod|
+					mod_name = project.get_module_display_name( mod.path )
+					mod_basename = mod.path.basename.to_s
+
+					if not exclude_module_names.include?( mod_basename )
+						mod.importlist.each do |import|
+							imported_module = import[ 0 ]
+							source_module = import[ 1 ]
+							
+							if mod_name == @project.name
+								source_module = mod_name + "#main"
+							end
+							
+							imported_module_name = imported_module.split('#')
+							source_module_name = source_module.split('#')
+
+							if imported_module_name.length == 1
+								imported_module_name << 'main' 
+								imported_module += "#main"
+							end
+							if source_module_name.length == 1
+								source_module_name << 'main' 
+								source_module += "#main"
+							end
+
+							# puts mod_name + ' ' + mod_basename + '## i:' + imported_module + '  s:' + source_module
+
+							if module_node_map[ source_module_name[0] ] != nil and module_node_map[ imported_module_name[0] ] != nil 						
+								
+								module_node_map[ source_module_name[0] ]['sections'][ source_module_name[1] ][ 'require' ] << imported_module
+								module_node_map[ imported_module_name[0] ]['sections'][ imported_module_name[1] ][ 'requiredby' ] << source_module
+							else
+								# puts '### not found s:' + source_module_name[0] + '  i:' + imported_module_name[0]
+							end
+						end
+					end
+				end	
+
+				paths = module_node_map.values.map{|x|x['path']}.uniq!
+				longestCommonPrefix = paths[ 0 ]
+				(1..paths.length-1).each do |i|
+					(0..[paths[i].length,longestCommonPrefix.length].min-1).each do |j|
+						if paths[i][j] != longestCommonPrefix[j]
+							longestCommonPrefix = paths[i][0..j-1]
+							break
+						end
+					end
+				end
+
+				filename_prefix ||= @project.name 
+				filename = filename_prefix + '_' + build.gsub(/\//, '_') + '_modules.html'
+
+				File.open(filename, 'w') do |file|
+					file.printf "<html>\n"
+					file.printf "<head>\n"
+					file.printf "<script type=\"text/javascript\">\n"
+					file.printf "	var modules = [];\n"
+
+					importpathmap = {}
+					module_node_map.each_pair do |mod_name,mod| 
+						file.printf "	modules['%s'] = { name:'%s', sections:[] };\n", mod_name, mod_name
+						mod['sections'].each_pair do |section_name,depedencies|
+							file.printf "	modules['%s'].sections['%s']={require:[", mod_name, section_name
+							depedencies['require'].each do |req|
+								reqs = req.split('#')
+								file.printf "{mod:'%s',sec:'%s'},", reqs[0], reqs[1]
+							end
+							file.printf "], requiredby:["
+							depedencies['requiredby'].each do |req|
+								reqs = req.split('#')
+								file.printf "{mod:'%s',sec:'%s'},", reqs[0], reqs[1]
+							end
+							file.printf "]};\n"
+						end
+						file.printf "	modules['%s'].path = '%s'\n", mod_name, mod['path']
+						
+						shortpath = mod['path'][ longestCommonPrefix.length, mod['path'].length-1]
+						
+						if importpathmap[ shortpath ] != nil
+							importpathmap[ shortpath ] << mod_name
+						else
+							importpathmap[ shortpath ] = [ mod_name ]
+						end
+					end
+
+					file.printf "\n	var importPaths = [];\n"
+					importpathmap.each_pair do |name,mods| 
+						file.printf "	importPaths.push( { name:'%s', score:1000, moduleScore:0, mods:[%s], xPos:0, yPos:0, column:0 } );\n", name, mods.map{|x|"modules['" + x.to_s + "']"}.join(',') 
+					end
+
+					paddingLeft = 20
+					paddingTop = 20
+					moduleWidth = 166
+					moduleHeight = 56
+					moduleSpaceX = 24
+					moduleSpaceY = 28
+					sectionWidth = 42
+					sectionHeight = 20
+					
+					modulesPerRow = ( 1800 - moduleWidth - paddingLeft - paddingLeft ) / ( moduleWidth + moduleSpaceX ) + 1
+					canvasWidth = modulesPerRow * ( moduleWidth + moduleSpaceX ) - moduleSpaceX + 2 * paddingLeft;
+					
+					file.printf "	
+	var paddingLeft = %d;
+	var paddingTop = %d;
+	var moduleWidth = %d;
+	var moduleHeight = %d;
+	var moduleSpaceX = %d;
+	var moduleSpaceY = %d;
+	var moduleTextOffsetY = 6;
+	var sectionWidth = %d;
+	var sectionHeight = %d;
+	var sectionSpace = 10;
+	var sectionOffsetY = 22;
+	var sectionTextOffsetY = 7;
+	var sectionLineOffsetY = 8;
+	var pathOffset = 6;
+	var pathTextOffset = 12;
+	var arrowSize = 10;
+	var textOffsetX = 4;
+	var textOffsetY = 4;
+	var modulesPerRow = %d;
+	var canvasWidth = %d;", paddingLeft, paddingTop, moduleWidth, moduleHeight, moduleSpaceX, moduleSpaceY, sectionWidth, sectionHeight, modulesPerRow, canvasWidth
+
+					file.printf "	
+
+	var types = { normal:0, child:1, childchild:2, parent:3, parentparent:4, selected:5 };
+	
+	var sectionStyles = [];
+	sectionStyles[ 0 ] = { rect:'#ffffff', text:'#000000' };
+	sectionStyles[ 1 ] = { rect:'#00ff00', text:'#000000' };
+	sectionStyles[ 2 ] = { rect:'#a0ffa0', text:'#000000' };
+	sectionStyles[ 3 ] = { rect:'#ff0000', text:'#ffffff' };
+	sectionStyles[ 4 ] = { rect:'#ffa0a0', text:'#ffffff' };
+	sectionStyles[ 5 ] = { rect:'#000000', text:'#ffffff' };
+
+	var moduleStyles = [];
+	moduleStyles[ 0 ] = { rect:'#ffffff', text:'#000000' };
+	moduleStyles[ 1 ] = { rect:'#80ff80', text:'#000000' };
+	moduleStyles[ 2 ] = { rect:'#e0ffe0', text:'#000000' };
+	moduleStyles[ 3 ] = { rect:'#ff8080', text:'#000000' };
+	moduleStyles[ 4 ] = { rect:'#ffe0e0', text:'#000000' };
+	moduleStyles[ 5 ] = { rect:'#bbbbbb', text:'#000000' };
+
+	var arrowStyles = [];
+	arrowStyles[ 0 ] = { stroke:'rgba( 0, 0, 0, 0.0 )' };
+	arrowStyles[ 1 ] = { stroke:'rgba( 0, 255, 0, 0.6 )' };
+	arrowStyles[ 2 ] = { stroke:'rgba( 128, 255, 128, 0.6 )' };
+	arrowStyles[ 3 ] = { stroke:'rgba( 255, 0, 0, 0.6 )' };
+	arrowStyles[ 4 ] = { stroke:'rgba( 255, 128, 128, 0.6 )' };
+	arrowStyles[ 5 ] = { stroke:'rgba( 0, 0, 0, 0.0 )' };
+
+	var currentModuleName = '';
+	var currentSectionName = '';
+	
+	var searchValue = '';
+
+	var canvas;
+	var ctx;
+
+	function trace( text )
+	{
+		document.getElementById( 'trace' ).innerHTML += text;
+	}
+			
+	function drawArrow( x1, y1, x2, y2 )
+	{
+		var angle = Math.atan2( y2 - y1, x2 - x1 );
+		ctx.moveTo( x1, y1 );
+		ctx.lineTo( x2, y2 );
+		ctx.lineTo( x2 - arrowSize * Math.cos( angle - Math.PI / 6 ), y2 - arrowSize * Math.sin( angle - Math.PI / 6 ) );
+		ctx.moveTo( x2, y2 );
+		ctx.lineTo( x2 - arrowSize * Math.cos( angle + Math.PI / 6 ), y2 - arrowSize * Math.sin( angle + Math.PI / 6 ) );		
+	}
+
+	function drawSection( module, sectionName )
+	{
+		ctx.font = '9px Arial';
+		ctx.textBaseline = 'middle';
+
+		var section = module.sections[ sectionName ];
+
+		var xPos = module.xPos + sectionSpace + section.index * ( sectionWidth + sectionSpace )
+		var yPos = module.yPos + sectionOffsetY;
+
+		ctx.fillStyle = sectionStyles[ section.type ].rect;
+		ctx.fillRect( xPos, yPos, sectionWidth, sectionHeight );
+
+		ctx.strokeStyle = '#000000';
+		ctx.lineWidth = 1;
+		ctx.strokeRect( xPos, yPos, sectionWidth, sectionHeight );
+
+		ctx.fillStyle = sectionStyles[ section.type ].text;
+		ctx.fillText( sectionName, xPos + textOffsetX, yPos + sectionTextOffsetY + textOffsetY, sectionWidth );
+	}
+					
+	function drawModule( name, module )
+	{
+		ctx.font = 'bold 10px Arial';
+		ctx.textBaseline = 'middle';
+
+		if( module.highlight )
+		{
+			ctx.strokeStyle = '#0000ff';
+			ctx.lineWidth = 6;
+			ctx.strokeRect( module.xPos - 6, module.yPos - 6, moduleWidth + 12, moduleHeight + 12 );
+		}
+	
+		ctx.fillStyle = moduleStyles[  module.type ].rect;
+		ctx.fillRect( module.xPos, module.yPos, moduleWidth, moduleHeight );
+
+		ctx.strokeStyle = '#000000';
+		ctx.lineWidth = 2;
+		ctx.strokeRect( module.xPos, module.yPos, moduleWidth, moduleHeight );
+
+		ctx.fillStyle = moduleStyles[ module.type ].text;
+		ctx.fillText( name, module.xPos + textOffsetX, module.yPos + moduleTextOffsetY + textOffsetY, moduleWidth );
+
+		for( var sectionName in module.sections )
+		{
+			drawSection( module, sectionName );
+		}
+	}
+
+	function drawImportPath( path )
+	{
+		ctx.font = 'bold 10px Arial';
+		ctx.textBaseline = 'middle';
+		
+		var modCount = path.mods.length;
+
+		var width = Math.min( modCount, modulesPerRow ) * ( moduleWidth + moduleSpaceX ) - moduleSpaceX;
+		var height = Math.floor( ( modCount + modulesPerRow - 1 ) / modulesPerRow ) * ( moduleHeight + moduleSpaceY ) - moduleSpaceY;
+
+		ctx.fillStyle = '#e0e0e0';
+		ctx.fillRect( path.xPos - pathOffset, path.yPos - pathOffset, width + 2 * pathOffset, height + 2 * pathOffset );
+
+		ctx.fillStyle = '#808080';
+		ctx.fillText( path.name, path.xPos, path.yPos - pathTextOffset );
+	}
+
+	function drawModuleDependencyLine( srcModule, srcSection, destModule, dstSection, type )
+	{
+		ctx.strokeStyle = arrowStyles[ type ].stroke;
+		ctx.beginPath();
+
+		if( srcModule == destModule )
+		{
+			var srcX = srcModule.xPos + sectionSpace + srcSection.index * ( sectionWidth + sectionSpace ) + sectionWidth / 2;
+			var dstX = srcModule.xPos + sectionSpace + dstSection.index * ( sectionWidth + sectionSpace ) + sectionWidth / 2;
+
+			var yPos = srcModule.yPos + sectionOffsetY + sectionHeight;
+			
+			ctx.moveTo( srcX, yPos );
+			ctx.lineTo( srcX, yPos + sectionLineOffsetY );
+			ctx.lineTo( dstX, yPos + sectionLineOffsetY );
+			drawArrow( dstX, yPos + sectionLineOffsetY, dstX, yPos );
+		}
+		else
+		{
+			var srcX = srcModule.xPos + sectionSpace + srcSection.index * ( sectionWidth + sectionSpace ) + sectionWidth / 2;
+			var srcY = srcModule.yPos + sectionOffsetY;
+
+			var dstX = destModule.xPos + sectionSpace + dstSection.index * ( sectionWidth + sectionSpace ) + sectionWidth / 2;
+			var dstY = destModule.yPos + sectionOffsetY + sectionHeight;
+
+			drawArrow( srcX, srcY, dstX, dstY );
+		}
+
+		ctx.stroke();
+		ctx.closePath();
+	}
+
+	function drawModuleDependencyLines( moduleName, module )
+	{
+		ctx.lineWidth = 2;
+
+		for( var sectionName in module.sections )
+		{
+			var section = module.sections[ sectionName ];
+			
+			if( section.type != types.normal )
+			{
+				for( var i = 0; i < section.require.length; ++i )
+				{
+					var require = section.require[ i ];
+					if( require.type == types.normal )
+					{
+						continue;
+					}
+					
+					var requireModule = modules[ require.mod ];
+					var requireSection = requireModule.sections[ require.sec ];
+
+					drawModuleDependencyLine( module, section, requireModule, requireSection, require.type );
+				}
+
+				for( var i = 0; i < section.requiredby.length; ++i )
+				{
+					var requiredby = section.requiredby[ i ];
+					if( requiredby.type == types.normal )
+					{
+						continue;
+					}
+					
+					var requiredbyModule = modules[ requiredby.mod ];
+					var requiredbySection = requiredbyModule.sections[ requiredby.sec ];
+					
+					drawModuleDependencyLine( requiredbyModule, requiredbySection, module, section, requiredby.type );
+				}
+			}
+		}
+	}
+
+	function drawGraph()
+	{
+		ctx.fillStyle = '#ffffff';
+		ctx.fillRect( 0, 0, canvas.width, canvas.height );
+
+		for( var i in importPaths )
+		{
+			drawImportPath( importPaths[ i ] );
+		}
+
+		for( var modName in modules )
+		{
+			drawModule( modName, modules[ modName ] );
+		}
+
+		for( var modName in modules )
+		{
+			drawModuleDependencyLines( modName, modules[ modName ] );
+		}
+	}
+
+	function setModuleTypes( type )
+	{
+		for( var moduleName in modules )
+		{
+			var module = modules[ moduleName ];
+			module.type = type;
+			
+			for( var sectionName in module.sections )
+			{
+				var section = module.sections[ sectionName ];
+				section.type = type;
+				
+				for( var i = 0; i < section.require.length; ++i )
+				{
+					section.require[ i ].type = type;
+				}
+				
+				for( var i = 0; i < section.requiredby.length; ++i )
+				{
+					section.requiredby[ i ].type = type;
+				}
+			}
+		}
+	}
+	
+	function setModuleScore()
+	{
+		for( var moduleName in modules )
+		{
+			var module = modules[ moduleName ];
+			module.score = 0;
+			
+			for( var sectionName in module.sections )
+			{
+				var section = module.sections[ sectionName ];
+				module.score = Math.max( section.score, module.score );
+			}
+		}
+	}
+	
+	function setSectionScore( module, sectionName, depth )
+	{
+		var section = module.sections[ sectionName ];
+		
+		section.score = Math.max( section.score, depth );
+		for( var i = 0; i < section.require.length; ++i )
+		{
+			var require = section.require[ i ];
+			setSectionScore( modules[ require.mod ], require.sec, depth + 1 );
+		}
+	}
+	
+	function setRequireDependencies( module, sectionName, first )
+	{
+		var section = module.sections[ sectionName ];
+
+		for( var i = 0; i < section.require.length; ++i )
+		{
+			var require = section.require[ i ];
+			
+			var requireModule = modules[ require.mod ];
+			var requireSection = modules[ require.mod ].sections[ require.sec ];
+			
+			if( ( first && ( requireSection.type == types.child ) ) ||
+				( !first && ( requireSection.type == types.childchild ) )  )
+			{
+				continue;
+			}
+
+			if( requireModule.type != types.parent )
+			{
+				requireModule.type = ( first ? types.parent : types.parentparent );
+			}
+			if( requireSection.type != types.parent )
+			{
+				requireSection.type = ( first ? types.parent : types.parentparent );
+			}
+			require.type = ( first ? types.parent : types.parentparent );
+			
+			setRequireDependencies( requireModule, require.sec, false );
+		}
+	}
+
+	function setRequiredByDependencies( module, sectionName, first )
+	{
+		var section = module.sections[ sectionName ];
+
+		for( var i = 0; i < section.requiredby.length; ++i )
+		{
+			var requiredby = section.requiredby[ i ];
+
+			var requiredByModule = modules[ requiredby.mod ];
+			var requiredBySection = modules[ requiredby.mod ].sections[ requiredby.sec ];
+
+			if( ( first && ( requiredBySection.type == types.child ) ) ||
+				( !first && ( requiredBySection.type == types.childchild ) )  )
+			{
+				continue;
+			}
+
+			if( requiredByModule.type != types.child ) 
+			{
+				requiredByModule.type = ( first ? types.child : types.childchild );
+			}
+			if( requiredBySection.type != types.child ) 
+			{
+				requiredBySection.type = ( first ? types.child : types.childchild );
+			}
+			requiredby.type = ( first ? types.child : types.childchild );
+			
+			setRequiredByDependencies( requiredByModule, requiredby.sec, false );
+		}
+	}
+
+	function setModuleDependencies( module, sectionName, select )
+	{
+		setRequireDependencies( module, sectionName, true );
+		setRequiredByDependencies( module, sectionName, true );
+
+		if( select )
+		{
+			var section = module.sections[ sectionName ];
+
+			section.type	= types.selected;
+			module.type 	= types.selected;
+		}
+	}
+
+	function getModuleAndSectionName( x, y )
+	{
+		for( var moduleName in modules )
+		{
+			var module = modules[ moduleName ];
+			
+			if( ( x >= module.xPos ) && ( x < module.xPos + moduleWidth ) &&
+				( y >= module.yPos ) && ( y < module.yPos + moduleHeight ) )
+			{
+				for( var sectionName in module.sections )
+				{
+					var section = module.sections[ sectionName ];
+					
+					var xPos = module.xPos + sectionSpace + section.index * ( sectionWidth + sectionSpace )
+					var yPos = module.yPos + sectionOffsetY;
+
+					if( ( x >= xPos ) && ( x < xPos + sectionWidth ) &&
+						( y >= yPos ) && ( y < yPos + sectionHeight ) )
+					{
+						return { moduleName:moduleName, sectionName:sectionName };
+					}	
+				}
+			}
+		}
+
+		return { moduleName:'', sectionName:'' };
+	}
+
+	function canvasMouseMove( e ) 
+	{
+		var x, y;
+		if( e.offsetX ) 
+		{
+			x = e.offsetX;
+			y = e.offsetY;
+		}
+		else if( e.layerX )
+		{
+			x = e.layerX - canvas.offsetLeft;
+			y = e.layerY - canvas.offsetTop;
+		} 
+		
+		var hit = getModuleAndSectionName( x, y );
+
+		if( ( hit.moduleName != currentModuleName ) || ( hit.sectionName != currentSectionName ) )
+		{
+			setModuleTypes( types.normal );
+			
+			currentModuleName = hit.moduleName;
+			currentSectionName = hit.sectionName;
+			
+			if( currentModuleName != '' )
+			{
+				setModuleDependencies( modules[ currentModuleName ], currentSectionName, true );
+			}
+			
+			drawGraph();
+		}
+	}
+
+	function isInImportPathModules( importPath, moduleName )
+	{
+		for( var i in importPath.mods )
+		{
+			if( importPath.mods[ i ].name == moduleName )
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	function createGraph() 
+	{ 
+		canvas = document.getElementById( 'graph' );
+		canvas.addEventListener( 'mousemove', canvasMouseMove, false );
+		
+		ctx = canvas.getContext( '2d' );
+
+		// initialize score, index and highlight
+		for( var moduleName in modules )
+		{
+			var module = modules[ moduleName ];
+			module.score = 0;
+			module.highlight = false;
+			var sectionIndex = 0;
+			for( var sectionName in module.sections )
+			{
+				var section = module.sections[ sectionName ];
+				section.index = sectionIndex;
+				section.score = 0;
+				sectionIndex++;
+
+				for( var i = 0; i < section.require.length; ++i )
+				{
+					section.require[ i ].available = true;
+				}
+				
+				for( var i = 0; i < section.requiredby.length; ++i )
+				{
+					section.requiredby[ i ].available = true;
+				}
+			}
+		}
+		
+		// calc section score
+		for( var moduleName in modules )
+		{
+			var module = modules[ moduleName ];
+			for( var sectionName in module.sections )
+			{
+				var section = module.sections[ sectionName ];
+				if( section.requiredby.length == 0 )
+				{
+					setSectionScore( module, sectionName, 0 );
+				}
+			}
+		}
+		// set modul score
+		setModuleScore();
+
+		for( var i in importPaths )
+		{
+			var importPath = importPaths[ i ];
+			for( var j in importPath.mods )
+			{
+				var module = importPath.mods[ j ];
+				importPath.moduleScore = Math.max( importPath.moduleScore, module.score );
+			}
+		}
+
+		var pathFound = true;
+		var pathScore = 0;
+		while( pathFound )
+		{
+			var emptyPaths = [];
+			for( var i in importPaths )
+			{
+				var importPath = importPaths[ i ];
+				if( importPath.score == 1000 )
+				{
+					pathFound = true;
+					var hasRequire = false;
+					
+					//trace( 'i:' + i + ' mods:' + importPath.mods.length + '<br>' );
+					var ttt = false;//( i == 2);//( ( module.name == 'edge' ) || ( module.name == 'stbdxt' ) );
+
+					for( var j in importPath.mods )
+					{
+						var module = importPath.mods[ j ];
+						
+						if( ttt ) trace( '##' + module.name + '<br>' );
+						
+						for( var sectionName in module.sections )
+						{
+							var section = module.sections[ sectionName ];
+
+							if( ttt ) trace( '####' + sectionName + ' ' + section.require.length + '<br>' );
+							
+							for( var k in section.require )
+							{
+								var require = section.require[ k ];
+								
+								if( ttt ) trace( '+' + sectionName + ':' + require.mod + ' ' + require.available + '<br>' );
+								
+								if( require.available && !isInImportPathModules( importPath, require.mod ) )
+								{
+									if( ttt ) trace( '!!!!!!!!!!<br>' );
+									hasRequire = true;
+									break;
+								}
+							}
+							if( hasRequire )
+							{
+								break;
+							}
+						}
+						if( hasRequire )
+						{
+							break;
+						}
+					}
+					if( !hasRequire )
+					{
+						emptyPaths.push( importPath );
+					}
+				}
+			}
+			
+			pathFound = ( emptyPaths.length > 0 );
+
+			//trace( ' ' + emptyPaths.length + ' ' + pathScore + '<br>' );
+
+			for( var i in emptyPaths )
+			{
+				var emptyPath = emptyPaths[ i ];
+				
+				emptyPath.score = pathScore;
+						
+				for( var moduleName in modules )
+				{
+					var module = modules[ moduleName ];
+					for( var sectionName in module.sections )
+					{
+						var section = module.sections[ sectionName ];
+						for( var j in section.require )
+						{
+							var require = section.require[ j ];
+							if( require.available )
+							{
+								for( var k in emptyPath.mods )
+								{
+									if( require.mod == emptyPath.mods[ k ].name )
+									{
+										//trace( 'f: ' + moduleName + '#' + sectionName + ':' + require.mod + '<br>' );
+										require.available = false;
+										break;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			
+			pathScore += 1;
+		}
+
+		importPaths.sort( function( a, b ) 
+			{ 
+				if( a.score == b.score )
+				{
+					return b.moduleScore - a.moduleScore; 
+				}
+				else
+				{
+					return a.score - b.score; 
+				}
+			} );
+
+		// update module position
+		var xPos = paddingLeft;
+		var yPos = paddingTop;
+		var lastScore = 0;
+		for( var i in importPaths )
+		{
+			var importPath = importPaths[ i ];
+
+			if( importPath.score != lastScore )
+			{
+				if( xPos > paddingLeft )
+				{
+					xPos = paddingLeft;
+					yPos += moduleHeight + moduleSpaceY;
+				}
+
+				yPos += 20;
+				lastScore = importPath.score;
+			}
+			else if( i > 0 )
+			{
+				var lastImportPath = importPaths[ i - 1 ];
+				var column = lastImportPath.column + lastImportPath.mods.length;
+				if( ( lastImportPath.mods.length > modulesPerRow ) || ( column + importPath.mods.length > modulesPerRow ) )
+				{
+					if( xPos > paddingLeft )
+					{
+						xPos = paddingLeft;
+						yPos += moduleHeight + moduleSpaceY;
+					}
+					column = 0;
+				}
+
+				importPath.column = column;
+			}
+
+			importPath.xPos = xPos;
+			importPath.yPos = yPos;
+
+			importPath.mods.sort( function( a, b ) { return b.score - a.score; } );
+
+			for( var j in importPath.mods )
+			{
+				var module = importPath.mods[ j ];
+
+				module.xPos = xPos;
+				module.yPos = yPos;
+				xPos += moduleWidth + moduleSpaceX;
+				if( xPos > canvasWidth - moduleWidth )
+				{
+					xPos = paddingLeft;
+					yPos += moduleHeight + moduleSpaceY;
+				}
+			}
+		}
+
+		// reset module type
+		setModuleTypes( types.normal );
+		
+		canvas.width = canvasWidth;
+		canvas.height = yPos + ( xPos == paddingLeft ? -moduleSpaceY : moduleHeight ) + paddingTop;
+		
+		drawGraph();
+	}
+	
+	function search( text )
+	{
+		if( searchValue == text )
+		{
+			return;
+		}
+		
+		var empty = ( text == '' );
+		var changed = false;
+		for( var moduleName in modules )
+		{
+			var module = modules[ moduleName ];
+			var highlight = ( moduleName.indexOf( text ) >= 0 ) && ( !empty );
+			if( highlight != module.highlight )
+			{
+				module.highlight = highlight;
+				changed = true;
+			}
+		}
+		
+		searchValue = text;
+		
+		if( changed )
+		{
+			drawGraph();
+		}
+	}
+</script>
+</head>
+<body onload=\"createGraph()\">
+	<h2>Module Graph for &quot;"
+					file.printf "%s&quot;</h2>
+	<div style=\"margin:1em\"><b>Highlight Module:</b> <input id=\"search\" type=\"text\" size=\"20\" maxlength=\"40\" onkeyup=\"search(this.value)\" onchange=\"(this.value)\" /></div>
+	<div><canvas id=\"graph\" width=\"100\" height=\"100\"></canvas></div>
+	<div id=\"trace\"></div>
+</body>
+</html>", @project.name + ' ' + build.gsub(/\//, ' ')
+				end
+			end
+		end
+	end
+end
+
+project_file = 'project.lace'
+exclude_module_names = []
+
+OptionParser.new do |opts|
+	opts.banner = "Usage: lace-module-graph.rb [OPTIONS] [BUILDS]"
+	opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+		project_file = fname
+	end
+	opts.on("-i", "--ignore module_name", "ignore a specific module") do |module_name|
+		exclude_module_names << module_name
+	end
+end.parse!
+
+if ARGV.empty?
+	puts 'Error: no build targets given.'
+	exit 1
+end
+
+writer = Lace::ModuleGraphWriter.new(project_file, ARGV)
+
+filename_prefix = nil
+writer.write( filename_prefix, exclude_module_names )
+

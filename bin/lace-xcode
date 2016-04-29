@@ -1,0 +1,269 @@
+#!/usr/bin/env ruby
+
+lib_dir = File.dirname(__FILE__) + '/../lib'
+$: << lib_dir if File.directory?(lib_dir + '/lace')
+
+require 'lace/projectwriterbase'
+require 'optparse'
+require 'fileutils'
+require 'lace/remote_builder'
+
+module Lace
+  class XcodeProjectWriter < ProjectFileWriterBase
+    class XcodeObject
+      attr_reader :uuid, :fields, :type
+      attr_accessor :written
+
+      def initialize(type)
+        @type = type
+        @uuid = XcodeObject.create_uuid()
+
+        @fields = {}
+      end
+
+      def [](name)
+        @fields[name]
+      end
+
+      def []=(name, value)
+        @fields[name] = value
+      end
+
+      @@fake_uuid = (0..2).inject(0) {|a, b| a = (a  | rand(2**24)) << 24 }
+      def self.create_uuid()
+        @@fake_uuid += 1
+        return sprintf("%24X", @@fake_uuid)
+      end
+    end
+
+    def write()
+      project_path = @project.path + (@project.name + '.xcodeproj')
+      FileUtils.mkpath(project_path)
+      root = generate_objects()
+      open_file(project_path + 'project.pbxproj') do |file|
+        file.puts '// !$*UTF8*$!'
+
+        file.puts '{'
+        file.puts "\tarchiveVersion = 1;"
+        file.puts "\tclasses = {};"
+        file.puts "\tobjectVersion = 46;"
+        file.puts "\tobjects = {"
+
+        write_object(file, root)
+
+        file.puts "\t};"
+        file.printf "\trootObject = %s;\n", root.uuid
+        file.puts '}'
+      end
+
+      schema_path = project_path + 'xcuserdata' + (ENV['USER'] + '.xcuserdatad') + 'xcschemes'
+      FileUtils.mkpath(schema_path)
+      open_file(schema_path + 'xschememanagement.plist') do |file|
+        file.puts '<?xml version="1.0" encoding="UTF-8"?>'
+        file.puts '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+        file.puts '<plist version="1.0">'
+        file.puts '<dict>'
+        file.puts '  <key>SchemeUserState</key>'
+        file.puts '  <dict>'
+        @builds.each_with_index do |build, index|
+          cleaned_build = build.gsub(/\//, '-')
+
+          write_scheme_file(schema_path, build, cleaned_build, root['targets'].first)
+
+          file.printf "    <key>%s.xcscheme</key>\n", cleaned_build
+          file.puts '    <dict>'
+          file.puts '    <key>orderHint</key>'
+          file.printf "    <integer>%d</integer>", index
+          file.puts '    </dict>'
+        end
+        file.puts '  </dict>'
+        file.puts '</dict>'
+        file.puts '</plist>'
+      end
+    end
+
+    def write_object(file, object)
+      return if object.written
+      object.written = true
+      referenced_objects = []
+      file.printf "\t%s = {\n\t\t\tisa = %s;\n", object.uuid, object.type
+      for key, value in object.fields
+        file.printf "\t\t\t%s = %s;\n", key, format_value(value, referenced_objects, "\t\t\t")
+      end
+      file.puts "\t\t};"
+      referenced_objects.each {|o| write_object(file, o) }
+    end
+
+    def format_value(value, referenced_objects, indent)
+      case value
+      when Array
+        sprintf "(\n%s\n%s)", value.map {|v| indent + "\t" + format_value(v, referenced_objects, indent + "\t") }.join(",\n"), indent
+      when Hash
+        sprintf "{\n%s%s}", value.map {|k, v| sprintf("%s\t%s = %s;\n", indent, k, format_value(v, referenced_objects, indent + "\t")) }.join, indent
+      when /\A\w+\Z/
+        value
+      when String
+        '"' + value + '"'
+      when XcodeObject
+        referenced_objects << value
+        value.uuid
+      else
+        value.to_s
+      end
+    end
+
+    def generate_objects()
+      root = XcodeObject.new(:PBXProject)
+      root['attributes'] = {'LastUpgradeCheck' => "0420", 'ORGANIZATIONNAME' => "foo ltd."}
+
+      root['targets'] = create_targets()
+
+      build_configs = @builds.map do |build|
+        config = XcodeObject.new(:XCBuildConfiguration)
+        config['name'] = build
+
+		if build.include? get_host_platform().to_s
+	        config['buildSettings'] =
+	        {
+	        	'BUILD' => build,
+				'MACOSX_DEPLOYMENT_TARGET' => '10.10',
+				'SDKROOT' => 'macosx'
+	        }
+	    else
+	        config['buildSettings'] =
+	        {
+	        	'BUILD' => build,
+	        	'IPHONEOS_DEPLOYMENT_TARGET' => @project.globals.ios_minimum_os_version.to_s,
+	        	'SDKROOT' => 'iphoneos'
+	        }
+	    end
+        config
+      end
+
+      build_config_list = XcodeObject.new(:XCConfigurationList)
+      build_config_list['buildConfigurations'] = build_configs
+      build_config_list['defaultConfigurationIsVisible'] = 0
+      build_config_list['defaultConfigurationName'] = @builds.first
+
+	  root['buildConfigurationList'] = build_config_list
+
+      root_group = XcodeObject.new(:PBXGroup)
+      root_group['sourceTree'] = "<group>"
+      root_group['children'] = []
+
+      root['mainGroup'] = root_group
+
+      for filename in get_files.map {|filename| Helpers.make_relative2(filename, Pathname.pwd) }.sort
+        insert_file(root_group, filename.sub(/^(\.\.\/)+/, ''), filename)
+      end
+
+      framework_group = XcodeObject.new(:PBXGroup)
+      framework_group['sourceTree'] = '<absolute>'
+      framework_group['name'] = 'Frameworks'
+      framework_group['children'] = []
+      frameworks = []
+      for build in @builds
+        get_attribute(:frameworks, build).each {|f| frameworks << f }
+      end
+      for framework in frameworks.uniq
+        file = XcodeObject.new(:PBXFileReference)
+        file['name'] = framework + '.framework'
+        file['lastKnownFileType'] = 'wrapper.framework'
+        file['path'] = '/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS5.0.sdk/System/Library/Frameworks/' + framework + '.framework'
+        file['sourceTree'] = '<group>'
+        framework_group['children'] << file
+      end
+
+      root_group['children'] << framework_group
+
+      return root
+    end
+
+    def create_targets()
+      lace_target = XcodeObject.new(:PBXLegacyTarget)
+      lace_target['buildArgumentsString'] = "#{@lace_bin + 'lace'} -b $(BUILD)"
+      lace_target['buildPhases'] = []
+      lace_target['buildToolPath'] = 'ruby'
+      lace_target['dependencies'] = []
+      lace_target['name'] = 'laceProject'
+      lace_target['passBuildSettingsInEnvironment'] = 0
+      lace_target['productName'] = 'laceProject'
+
+      return [lace_target]
+    end
+
+    def insert_file(group, filename, full_path)
+      local_name, rest = filename.split('/', 2)
+      if rest
+        sub_group = group['children'].find {|g| g['name'] == local_name }
+        unless sub_group
+          sub_group = XcodeObject.new(:PBXGroup)
+          sub_group['sourceTree'] = "<group>"
+          sub_group['name'] = local_name
+          sub_group['children'] = []
+          group['children'] << sub_group
+        end
+        insert_file(sub_group, rest, full_path)
+      else
+        file_object = XcodeObject.new(:PBXFileReference)
+        file_object['path'] = full_path
+        file_object['name'] = local_name
+        file_object['sourceTree'] = "<group>"
+        group['children'] << file_object
+      end
+    end
+
+    def write_scheme_file(schema_path, build, cleaned_build, target)
+      exeExtension = ( build.include? get_host_platform().to_s ) ? '' : '.app'
+      open_file(schema_path + (cleaned_build + '.xcscheme')) do |file|
+        file.puts '<?xml version="1.0" encoding="UTF-8"?>'
+        file.puts '<Scheme version="1.3">'
+        file.puts '  <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">'
+        file.puts '    <BuildActionEntries>'
+        file.puts '      <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">'
+        file.printf "        <BuildableReference BuildableIdentifier=\"primary\" BlueprintIdentifier=\"%s\" BuildableName=\"%s\" BlueprintName=\"%s\" ReferencedContainer=\"container:%s.xcodeproj\"/>\n", target.uuid, cleaned_build, cleaned_build, @project.name
+        file.puts '      </BuildActionEntry>'
+        file.puts '    </BuildActionEntries>'
+        file.puts '  </BuildAction>'
+        file.printf "  <TestAction selectedDebuggerIdentifier=\"Xcode.DebuggerFoundation.Debuffer.GDB\" selectedLauncherIdentifier=\"Xcode.DebuggerFoundation.Launcher.GDB\" shouldUseLaunchSchemeArgsEnv=\"YES\" buildConfiguration=\"%s\">\n", build
+        file.puts '    <Testables/>'
+        file.puts '  </TestAction>'
+        file.puts '  <LaunchAction selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.GDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.GDB"'
+        file.printf "    launchStyle=\"0\" useCustomWorkingDirectory=\"NO\" buildConfiguration=\"%s\"\n", build
+        file.puts '    debugDocumentVersioning="YES" allowLocationSimulation="YES">'
+        file.printf "    <PathRunnable FilePath=\"%s\"/>\n", @project.path + 'build' + build + (@project.name + exeExtension)
+        file.puts '  </LaunchAction>'
+        file.puts '</Scheme>'
+      end
+    end
+  end
+end
+
+project_file = 'project.lace'
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: lace-xcode [OPTIONS] [BUILDS]"
+  opts.on("-p", "--project PROJECT_FILE", "The project file to read (default: project.lace)") do |fname|
+    project_file = fname
+  end
+end.parse!
+
+# xcode project only works on osx..
+if (/darwin/ =~ RUBY_PLATFORM) != nil
+	writer = Lace::XcodeProjectWriter.new(project_file, ARGV)
+	writer.write()
+else
+	# load the project to find the remote build settings
+	build_path = nil
+	build = ARGV[1].split('/')	# todo: improve this..
+	project = Lace::Project.load(project_file, build, build_path)
+	# run lace-xcode remotely:
+	if not project.is_remote_build
+		raise "This project has no remote build configuration!"
+	end
+
+	remote_build_config = project.remote_build_config
+	builder = Lace::RemoteBuilder.new remote_build_config
+	project_path = project.path + (project.name + '.xcodeproj')
+	builder.remote_lace_xcode( File.expand_path( project_file ), project_path  )
+end
