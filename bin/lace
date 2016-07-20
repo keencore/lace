@@ -41,7 +41,7 @@
 # THE SOFTWARE.
 
 # change this to trigger a rebuild of all (!) projects
-lace_version = 46
+lace_version = 47
 
 startTime = Time.now.to_f
 
@@ -65,6 +65,33 @@ skip_remote_build = false
 skip_invalid_targets = false
 keep_dirs = []
 
+$project_name = ''
+$track_time = false
+
+def track_build_time( start_time, build )
+	return if !$track_time
+
+	end_time = Time.now.to_f
+
+	isWindows = /cygwin|mswin|mingw/ =~ RUBY_PLATFORM
+	exeExtension = isWindows ? '.exe' : ''
+	platformPath = isWindows ? 'win32_x64' : /darwin/ =~ RUBY_PLATFORM ? 'osx_x64' : 'linux_x64'
+
+	binPath = Pathname.new( __FILE__ ) + "../../../../bin/#{platformPath}/"
+	firePath = binPath + "fire#{exeExtension}"
+	trackerPath = binPath + "tracker#{exeExtension}"
+
+	if File.exist?( firePath ) && File.exist?( trackerPath )
+
+		taskName = "#{$project_name} #{build}"
+		durarionInMs = ( ( end_time - start_time ) * 1000 ).to_i
+		trackerCmd = "\"#{firePath.to_s}\" \"#{trackerPath.to_s}\" time lace \"#{taskName}\" #{durarionInMs}"
+
+		#puts "start #{trackerCmd}"
+		system( trackerCmd )
+	end
+end
+
 def build_project( project_filename, build, build_path, clean, num_jobs, skip_remote_build, skip_invalid_targets, lace_version, keep_dirs )
 
 	# load the config:
@@ -72,6 +99,9 @@ def build_project( project_filename, build, build_path, clean, num_jobs, skip_re
 	raise "No lace-config.json found" if not config
 
 	project = Lace::Project.load(project_filename, config, build.split('/'), build_path, skip_invalid_targets )
+
+	$project_name = project.name 
+	$track_time = config.track_time
 
 	keep_dirs.each { |kd|
 		project.global_context.add_attribute :sticky_build_directories, kd.to_s
@@ -204,6 +234,7 @@ if build == "all"
 	end
 
 	if exceptionCatched then
+		track_build_time( startTime, build )
 		exit 1
 	end
 else
@@ -212,10 +243,12 @@ else
 	rescue SystemExit => e
 		if( ! e.success? )
 			puts "ERROR: " + parseRubyExceptionMessage(e.to_s + "\n" + e.backtrace.join("\n"))
+			track_build_time( startTime, build )
 			exit 1
 		end
 	rescue Exception => e
 		puts "ERROR: " + parseRubyExceptionMessage(e.to_s + "\n" + e.backtrace.join("\n"))
+		track_build_time( startTime, build )
 		exit 1
 	end
 end
@@ -223,4 +256,7 @@ end
 endTime = Time.now.to_f
 endTimeString = Time.now.strftime( '%H:%M:%S' )
 
-puts 'Build finished in ' + ( endTime - startTime ).round( 1 ).to_s + "s at #{endTimeString}" if not build.empty?
+if not build.empty?
+	puts 'Build finished in ' + ( endTime - startTime ).round( 1 ).to_s + "s at #{endTimeString}" 
+	track_build_time( startTime, build )
+end

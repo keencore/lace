@@ -56,17 +56,28 @@ end
 
 module Lace
 	class Blob
-		def self.fetch( config, blob_path, required_hash )
-			blob_storage = config.blob_storage
+		def self.fetch( config, server_id, blob_path, required_hash )
+			# check if the config is correct:
+			raise "No Blob Servers configured!" if !config.blob_servers
+			raise "No Blob Storage configured!" if !config.blob_local_path
 
-			local_path = (config.blob_local_path + blob_path).expand_path
+			blob_servers = config.blob_servers
+			blob_server = blob_servers[server_id]
+
+			if !blob_server
+				raise "Unknown blob server '#{server_id}'"
+			end
+
+			local_path = (config.blob_local_path + blob_server.directory + blob_path).expand_path
 			blob_content_path = local_path + blob_content_filename()
 
-			case blob_storage.type
-			when "svn"
+			# check if the local path exists and if the hash file is present:
+			if !File.exists?( blob_content_path )
+				got_blob = false
+				case blob_server.type
+				when "svn"
 				# check if the local path exists and if the hash file is present:
-				if !File.exists?( blob_content_path )
-					svn_remote_path = blob_storage.path + blob_path
+					svn_remote_path = blob_server.path + blob_path
 					# no: export the svn path into the local path
 					blob_dir = blob_content_path.dirname
 					if File.exists?(blob_dir)
@@ -75,8 +86,8 @@ module Lace
 					else
 						FileUtils.mkdir_p blob_dir.dirname
 					end
-					if blob_storage.user
-						svn_command_line = "svn --username #{blob_storage.user} --password #{blob_storage.password} --no-auth-cache export #{svn_remote_path} #{local_path}"
+					if blob_server.user
+						svn_command_line = "svn --username #{blob_server.user} --password #{blob_server.password} --no-auth-cache export #{svn_remote_path} #{local_path}"
 					else
 						svn_command_line = "svn export #{svn_remote_path} #{local_path}"
 					end
@@ -84,16 +95,15 @@ module Lace
 					#p "svn_command_line=#{svn_command_line}"
 					result = system svn_command_line
 					if !result
-						raise "Exporting of Blob #{blob_path} from svn failed!"
+						raise "Could not get blob '#{blob_path}' from server '#{server_id} !"
 					end
 					puts "Creating Content Hash..."
 					write_blob_directory_hash_file( local_path )
+				when "local"
+					# just return the local path:
+				else
+					raise "Invalid Blob storage type #{blob_server.type}"
 				end
-
-			when "local"
-				# just return the local path:
-			else
-				raise "Invalid Blob storage type #{blob_storage.type}"
 			end
 
 			# check the content of the hash file:

@@ -170,12 +170,8 @@ module Lace
 			@module_aliases[new_name] = @module_aliases[new_name] || old_name
 		end
 
-		def add_blob(blob_path,required_hash)
-			# check if the config is correct:
-			raise "No Blob Storage configured!" if !@config.blob_storage
-			raise "No Blob Storage configured!" if !@config.blob_local_path
-
-			return Blob.fetch(@config,blob_path,required_hash)
+		def add_blob(server_id,blob_path,required_hash)
+			return Blob.fetch(@config,server_id,blob_path,required_hash)
 		end
 
 		def add_import(module_name, importing_module,weak)

@@ -26,10 +26,10 @@ require 'json'
 module Lace
 
 	class Config
-		attr_reader :blob_storage, :blob_local_path, :target_platforms
+		attr_reader :blob_servers, :blob_local_path, :track_time
 
 		RemoteMapping = Struct.new :remote_host, :remote_user, :identity_file, :remote_path, :local_path, :exclude_pattern, :remote_lace_path
-		BlobStorage = Struct.new :type, :path, :user, :password
+		BlobServer = Struct.new :type, :path, :directory, :user, :password
 
 		def initialize( config_path )
 			@path = config_path
@@ -47,25 +47,27 @@ module Lace
 				end
 			end
 
-			blob_storage_config = config['blob_storage' ]
-			if blob_storage_config
-				@blob_storage = BlobStorage.new(
-					blob_storage_config[ 'type' ],
-					Pathname.new( blob_storage_config[ 'path' ] ),
-					blob_storage_config[ 'user' ],
-					blob_storage_config[ 'password'] )
-			else
-				@blob_storage = nil
+			@blob_servers = {}
+			blob_servers_config = config['blob_servers' ]
+			if blob_servers_config
+				blob_servers_config.each {|server_id,server_config|
+					@blob_servers[server_id] = BlobServer.new(
+						server_config[ 'type' ],
+						Pathname.new( server_config[ 'path' ] ),
+						server_config[ 'directory' ] || '',
+						server_config[ 'user' ],
+						server_config[ 'password'] )
+				}
 			end
+			#puts "@blob_servers=#{@blob_servers.join( ',')}"
 			@blob_local_path = Helpers.normalize_path( Pathname.new( ENV['LACE_BLOB_PATH'] || Helpers.default_blob_path ) )
-
-			@target_platforms = config['target_platforms'].map{|p| p.to_sym}
+			@track_time = config[ 'track_time' ] || true
 		end
 
 		def find_mapping(dir)
 			@path_mappings.each { |mapping|
 				local_mapping_path = @path.dirname + mapping['local_path']
-				p "Testing path #{local_mapping_path}"
+				#p "Testing path #{local_mapping_path}"
 				if Helpers.is_child_dir_of( dir, local_mapping_path )
 					remote_mapping_path = Pathname.new( @remote_target['path'] ) + mapping['remote_path']
 					return RemoteMapping.new(@remote_target['host'], @remote_target['user'], @remote_target['identity'], remote_mapping_path, local_mapping_path, mapping['exclude_pattern'], mapping['remote_lace_path'])

@@ -1,3 +1,4 @@
+#! ruby
 
 lib_dir = File.dirname(__FILE__) + '/../lib'
 $: << lib_dir if File.directory?(lib_dir + '/lace')
@@ -28,6 +29,14 @@ module Lace
 			return configuration_name.start_with? 'uwp'
 		end
 
+		def is_native_nx_config( configuration_name )
+			return configuration_name.start_with?( 'nx/' )
+		end
+
+		def is_xb1_config( configuration_name )
+			return configuration_name.start_with? 'xb1'
+		end
+
 		def is_android_arm_config( configuration_name )
 			return configuration_name.start_with? 'android_arm'
 		end
@@ -51,7 +60,7 @@ module Lace
 			project = find_project(build)
 			platform = get_attribute(:vcproj_platform, build).first || "Win32"
 
-			if !write_uwp
+			if is_uwp_config( build ) && !write_uwp
 				platform = "Win32"
 			end
 
@@ -111,6 +120,10 @@ module Lace
 						end
 					end
 				else
+					configs = []
+					platforms = []
+					valid_configurations = []
+
 					sorted_builds.each do |build|
 						project = find_project(build)
 						platform = get_platform(build, write_uwp)
@@ -124,9 +137,27 @@ module Lace
 							end
 						end
 
+						configs << configuration_name
+						platforms << platform
+						valid_configurations << "#{configuration_name}|#{platform}"
+
 						file.puts "\t\t<ProjectConfiguration Include=\"#{configuration_name}|#{platform}\">\n"
 						file.puts "\t\t\t<Configuration>#{configuration_name}</Configuration>\n"
 						file.puts "\t\t\t<Platform>#{platform}</Platform>\n"
+						file.puts "\t\t</ProjectConfiguration>\n"
+					end
+
+					configs.uniq!
+					platforms.uniq!
+
+					# :JK: we have to write all other combinations as well.. even though we will never build them:
+					all_configurations = configs.product( platforms ).collect {|c,p| "#{c}|#{p}"}
+					remaining_configurations = all_configurations - valid_configurations
+					remaining_configurations.each do |config|
+						c, p = config.split( '|' )
+						file.puts "\t\t<ProjectConfiguration Include=\"#{config}\">\n"
+						file.puts "\t\t\t<Configuration>#{c}</Configuration>\n"
+						file.puts "\t\t\t<Platform>#{p}</Platform>\n"
 						file.puts "\t\t</ProjectConfiguration>\n"
 					end
 				end
@@ -155,6 +186,8 @@ module Lace
 
 				file.puts "\t<Import Project=\"$(VCTargetsPath)\\Microsoft.Cpp.Default.props\" />\n"
 
+				require_lace_build = false
+
 				sorted_builds.each do |build|
 					project = find_project(build)
 					platform = get_platform(build, write_uwp)
@@ -162,11 +195,6 @@ module Lace
 
 					target_dir = make_local(project.build_path)
 					build_cmd = build_command(build, jobs,"&quot;",keep_dirs)
-
-					executable_extension = get_attribute(:vcproj_executable_extension, build).first || ".exe"
-					executable_base_filename = get_attribute(:executable_basename,build).first || (@project.globals.target_name || @project.name)
-					executable_namer = get_attribute(:executable_name_creator, build).first
-					executable_filename = executable_namer ? executable_namer.call(project, executable_base_filename) : executable_base_filename + executable_extension
 
 					if write_tegra
 						if is_android_arm_config( configuration_name )
@@ -207,10 +235,14 @@ module Lace
 						file.puts "\t\t<UseDebugLibraries>true</UseDebugLibraries>\n" if is_debug_config( build )
 						file.puts "\t\t<LaceBuild>#{build}</LaceBuild>"
 						file.puts "\t</PropertyGroup>\n"
+						require_lace_build = true
 					elsif !write_uwp
 						file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\" Label=\"Configuration\">\n"
-						file.puts "\t\t<ConfigurationType>Makefile</ConfigurationType>\n"
-						file.puts "\t</PropertyGroup>\n"
+	    				file.puts "\t\t<ConfigurationType>Application</ConfigurationType>\n"
+	    				file.puts "\t\t<UseDebugLibraries>true</UseDebugLibraries>\n" if is_debug_config( build )
+	    				file.puts "\t\t<LaceBuild>#{build}</LaceBuild>\n"
+	    				file.puts "\t</PropertyGroup>\n"
+	    				require_lace_build = true
 					end
 				end
 
@@ -243,6 +275,13 @@ module Lace
 
 						file.puts "\t<ImportGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\" Label=\"PropertySheets\">\n"
 						file.puts "\t\t<Import Project=\"$(UserRootDir)\\Microsoft.Cpp.$(Platform).user.props\" Condition=\"exists('$(UserRootDir)\\Microsoft.Cpp.$(Platform).user.props')\" Label=\"LocalAppDataPlatform\" />\n"
+
+						if is_native_nx_config( build )
+	    					nx_sdk_path = project.globals.nx_sdk_path
+    						file.puts "\t\t<Import Project=\"#{nx_sdk_path}\\Build\\Vc\\ForApplication\\NintendoSdkSpec_NX.props\"/>\n"
+    						file.puts "\t\t<Import Project=\"#{nx_sdk_path}\\Build\\Vc\\ForApplication\\NintendoSdkBuildType_Debug.props\"/>\n"
+    						file.puts "\t\t<Import Project=\"#{nx_sdk_path}\\Build\\Vc\\ForApplication\\NintendoSdkVcProjectSettings.props\"/>\n"
+    					end
 						file.puts "\t</ImportGroup>\n"
 					end
 				end
@@ -255,7 +294,8 @@ module Lace
 						platform = get_platform(build, write_uwp)
 						configuration_name = build.gsub(/\//, '_')
 
-						build_directory = build.gsub(/\//, '\\')
+						intermediate_directory = build.gsub(/\//, '\\') + '\\intermediate\\'
+						output_directory = build.gsub(/\//, '\\') + '\\'
 
 						if write_uwp
 							if is_uwp_config( build )
@@ -266,8 +306,27 @@ module Lace
 						end
 
 						file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\">\n"
-						file.puts "\t\t<IntDir>#{build_directory}\\intermediate\\</IntDir>\n"
-						file.puts "\t\t<OutDir>#{build_directory}\\</OutDir>\n"
+
+						if is_xb1_config( build )
+							deploy_directory = output_directory + 'package'
+							deploy_directory = deploy_directory.gsub(/\//, '\\') + '\\'
+							file.puts "\t\t<LayoutDir>#{deploy_directory}</LayoutDir>\n"
+						end
+
+						file.puts "\t\t<IntDir>#{intermediate_directory}</IntDir>\n"
+						file.puts "\t\t<OutDir>#{output_directory}</OutDir>\n"
+
+						executable_extension = get_attribute(:vcproj_executable_extension, build).first || ".exe"
+						executable_base_filename = get_attribute(:executable_basename,build).first || (@project.globals.target_name || @project.name)
+
+						if executable_base_filename != project_name
+							file.puts "\t\t<TargetName>#{executable_base_filename}</TargetName>\n"
+						end
+
+						if executable_extension != ".exe"
+							file.puts "\t\t<TargetExt>#{executable_extension}</TargetExt>"
+						end
+
 						file.puts "\t</PropertyGroup>\n"
 					end
 
@@ -279,42 +338,27 @@ module Lace
 						target_dir = make_local(project.build_path)
 						build_cmd = build_command(build, jobs,"&quot;",keep_dirs)
 
-						executable_extension = get_attribute(:vcproj_executable_extension, build).first || ".exe"
-						executable_base_filename = get_attribute(:executable_basename,build).first || (@project.globals.target_name || @project.name)
-						executable_namer = get_attribute(:executable_name_creator, build).first
-						executable_filename = executable_namer ? executable_namer.call(project, executable_base_filename) : executable_base_filename + executable_extension
+						include_dirs = get_attribute(:cpp_include_dir, build)
+						include_dirs += get_attribute(:cpp_system_include_dir, build)
+						include_dirs_string = include_dirs.map {|einc| make_local(einc)}.join(';')
 
 						if is_uwp_config( build ) && write_uwp
 							configuration_name = remove_platform_from_configuration( configuration_name )
-							include_dirs = get_attribute(:cpp_include_dir, build).map {|einc| make_local(einc)}.join(';')
-							libs = get_attribute(:libs).join(';')
-
-							file.puts "\t<ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\">\n"
-							file.puts "\t\t<ClCompile>\n"
-							file.puts "\t\t\t<PrecompiledHeader>NotUsing</PrecompiledHeader>\n"
-							file.puts "\t\t\t<PreprocessorDefinitions>#{get_attribute(:cpp_define, build).join(';')}</PreprocessorDefinitions>\n"
-							file.puts "\t\t\t<AdditionalIncludeDirectories>#{include_dirs}</AdditionalIncludeDirectories>\n"
-							file.puts "\t\t</ClCompile>\n"
-							file.puts "\t\t<Link>\n"
-							file.puts "\t\t\t<AdditionalDependencies>#{libs}</AdditionalDependencies>\n"
-							file.puts "\t\t\t<AdditionalLibraryDirectories></AdditionalLibraryDirectories>\n"
-							file.puts "\t\t</Link>\n"
-							file.puts "\t</ItemDefinitionGroup>\n"
-						elsif !write_uwp
-							file.puts "\t<PropertyGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\">\n"
-							file.puts "\t\t<NMakeBuildCommandLine>#{build_cmd}</NMakeBuildCommandLine>\n"
-							file.puts "\t\t<NMakeReBuildCommandLine>#{build_cmd} -r</NMakeReBuildCommandLine>\n"
-							file.puts "\t\t<NMakeCleanCommandLine>#{build_cmd} -c</NMakeCleanCommandLine>\n"
-							file.puts "\t\t<NMakeOutput>#{target_dir}\\#{executable_filename}</NMakeOutput>\n"
-							file.puts "\t\t<NMakePreprocessorDefinitions>#{get_attribute(:cpp_define, build).join(';')}</NMakePreprocessorDefinitions>\n"
-							file.write "\t\t<NMakeIncludeSearchPath>"
-							include_dirs = get_attribute(:cpp_include_dir, build)
-							unless include_dirs.empty?
-								file.write include_dirs.map {|einc| make_local(einc)}.join(';')
-							end
-							file.puts "</NMakeIncludeSearchPath>\n"
-							file.write "\t</PropertyGroup>\n"
 						end
+
+						libs = get_attribute(:libs).join(';')
+
+						file.puts "\t<ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='#{configuration_name}|#{platform}'\">\n"
+						file.puts "\t\t<ClCompile>\n"
+						file.puts "\t\t\t<PrecompiledHeader>NotUsing</PrecompiledHeader>\n"
+						file.puts "\t\t\t<PreprocessorDefinitions>#{get_attribute(:cpp_define, build).join(';')}</PreprocessorDefinitions>\n"
+						file.puts "\t\t\t<AdditionalIncludeDirectories>#{include_dirs_string}</AdditionalIncludeDirectories>\n"
+						file.puts "\t\t</ClCompile>\n"
+						file.puts "\t\t<Link>\n"
+						file.puts "\t\t\t<AdditionalDependencies>#{libs}</AdditionalDependencies>\n"
+						file.puts "\t\t\t<AdditionalLibraryDirectories></AdditionalLibraryDirectories>\n"
+						file.puts "\t\t</Link>\n"
+						file.puts "\t</ItemDefinitionGroup>\n"
 					end
 				end
 
@@ -351,13 +395,16 @@ module Lace
 				file.puts "\t<ImportGroup Label=\"ExtensionTargets\">\n"
 				file.puts "\t</ImportGroup>\n"
 
-				if write_uwp
-					uwp_build_cmd = build_command(sorted_builds.first, jobs, "",keep_dirs).gsub('-b ' + sorted_builds.first, '-b $(LaceBuild)')
+				if require_lace_build
+					lace_build_cmd = build_command(sorted_builds.first, jobs, "",keep_dirs).gsub('-b ' + sorted_builds.first, '-b $(LaceBuild)')
 					file.puts "\t<Target Name=\"Build\" Condition=\"'$(ConfigurationType)' == 'Application'\" Outputs=\"$(TargetPath)\" DependsOnTargets=\"_PrepareForBuild\">\n"
-					file.puts "\t\t<Exec Command=\"#{uwp_build_cmd}\" />\n"
+					file.puts "\t\t<Exec Command=\"#{lace_build_cmd}\" />\n"
 					file.puts "\t</Target>\n"
 					file.puts "\t<Target Name=\"Clean\" Condition=\"'$(ConfigurationType)' == 'Application'\" DependsOnTargets=\"$(CleanDependsOn)\">\n"
-					file.puts "\t\t<Exec Command=\"#{uwp_build_cmd} -c\" />\n"
+					file.puts "\t\t<Exec Command=\"#{lace_build_cmd} -c\" />\n"
+					file.puts "\t</Target>\n"
+					file.puts "\t<Target Name=\"Rebuild\" Condition=\"'$(ConfigurationType)' == 'Application'\" DependsOnTargets=\"$(CleanDependsOn)\">\n"
+					file.puts "\t\t<Exec Command=\"#{lace_build_cmd} -r\" />\n"
 					file.puts "\t</Target>\n"
 				end
 

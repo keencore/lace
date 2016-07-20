@@ -35,7 +35,7 @@ module Lace
 			@identity_file = identity_file
 
 			if @is_win32_host
-				@rsync_path = Blob.fetch( blob_config, "public/cwrsync/cwrsync-5.4.1", "d4d881cf5930b774e207c06e08af20aff55e248c" )				
+				@rsync_path = Blob.fetch( blob_config, "core", "public/cwrsync/cwrsync-5.4.1", "d4d881cf5930b774e207c06e08af20aff55e248c" )				
 				@rsync_binary = @rsync_path + 'cwrsync.cmd'
 				@ssh_binary = @rsync_path + 'plink.exe'	
 				@ssh_login = "#{@rsync_path}/cygnative.exe #{@rsync_path}/plink.exe -batch"

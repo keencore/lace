@@ -138,8 +138,8 @@ module Lace
 			@current_base_path = last_base_path
 		end
 
-		def add_blob(blob_path,content_hash)
-			return @project.add_blob(blob_path, content_hash)
+		def add_blob(server_id,blob_path,content_hash)
+			return @project.add_blob(server_id,blob_path, content_hash)
 		end
 
 		def add_license(license_type)
@@ -151,10 +151,10 @@ module Lace
 			return @licenses
 		end
 
-		def third_party_blob(blob_path,content_hash,license)
+		def third_party_blob(server_id,blob_path,content_hash,license)
 
 			# add this blob to the download list
-			local_path = @project.add_blob(blob_path, content_hash)
+			local_path = @project.add_blob(server_id,blob_path, content_hash)
 
 			last_base_path = @current_base_path
 			@current_base_path = local_path
